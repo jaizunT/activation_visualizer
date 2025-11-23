@@ -110,6 +110,15 @@ function buildChainRuleForParam(param: ParamChip, architecture: Architecture): s
 }
 
 function buildBackSignalForLayer(layerLabel: string): string {
+  if (
+    layerLabel.startsWith('Input') ||
+    layerLabel.startsWith('Input Seq') ||
+    layerLabel.startsWith('Token') ||
+    layerLabel.startsWith('Positional')
+  ) {
+    return '';
+  }
+
   if (layerLabel.startsWith('RNN')) {
     return '\\frac{\\partial L}{\\partial h_{t-1}}';
   }
@@ -176,6 +185,14 @@ export default function App() {
 
   const activeInputIndex = pinnedInputIndex ?? hoveredInputIndex;
   const activeParamIndex = pinnedParamIndex ?? hoveredParamIndex;
+
+  const effectiveInputDim = useMemo(() => {
+    if (architecture === 'cnn') {
+      const size = Math.max(4, Math.min(8, inputDim || 4));
+      return size * size;
+    }
+    return inputDim;
+  }, [architecture, inputDim]);
 
   const runSimulation = useCallback(() => {
     setLoading(true);
@@ -256,11 +273,38 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [architecture, layers, hiddenDim, activation, inputDim, attnHeads, initMode, initValue, inputValue, inputVector, setNodes, setEdges, paramOverrides]);
+  }, [
+    architecture,
+    layers,
+    hiddenDim,
+    activation,
+    inputDim,
+    attnHeads,
+    initMode,
+    initValue,
+    inputValue,
+    inputVector,
+    setNodes,
+    setEdges,
+    paramOverrides,
+  ]);
 
   useEffect(() => {
     runSimulation();
-  }, [architecture, layers, hiddenDim, activation, inputDim, attnHeads, initMode, initValue, inputValue, inputVector]);
+  }, [
+    runSimulation,
+    architecture,
+    layers,
+    hiddenDim,
+    activation,
+    inputDim,
+    attnHeads,
+    initMode,
+    initValue,
+    inputValue,
+    inputVector,
+    paramOverrides,
+  ]);
 
   const highlightPathTo = useCallback(
     (nodeId: string | null) => {
@@ -324,13 +368,17 @@ export default function App() {
     },
     [activeParam, activeNodeParams, architecture],
   );
-  const effectiveLayerLabel = pinnedNodeId
+
+  // Chain-rule overlay: hover takes precedence, but when nothing is hovered fall back to pinned.
+  const effectiveLayerLabel = activeLayerLabel
+    ? activeLayerLabel
+    : pinnedNodeId
     ? (() => {
         const node = nodes.find((n) => n.id === pinnedNodeId);
         const data = node?.data as { label?: string } | undefined;
-        return data?.label ?? activeLayerLabel;
+        return data?.label ?? null;
       })()
-    : activeLayerLabel;
+    : null;
 
   const overlayBackSignal = useMemo(
     () => (effectiveLayerLabel ? buildBackSignalForLayer(effectiveLayerLabel) : null),
@@ -342,27 +390,103 @@ export default function App() {
 
     const cap = 16;
 
-    // For MLP, prefer true forward-pass samples from the engine
-    if (architecture === 'mlp') {
-      const inSample = activeLayerDetails.input_sample;
-      const outSample = activeLayerDetails.output_sample;
+    const isInputLike =
+      effectiveLayerLabel &&
+      (effectiveLayerLabel.startsWith('Input') ||
+        effectiveLayerLabel.startsWith('Input Seq') ||
+        effectiveLayerLabel.startsWith('Token') ||
+        effectiveLayerLabel.startsWith('Positional'));
 
-      if ((inSample && inSample.length) || (outSample && outSample.length)) {
-        const inVec =
-          inSample && inSample.length
-            ? inSample.slice(0, cap)
-            : outSample
-            ? outSample.slice(0, cap)
-            : [];
-        const outVec =
-          outSample && outSample.length
-            ? outSample.slice(0, cap)
-            : inSample
-            ? inSample.slice(0, cap)
-            : [];
+    if (isInputLike) {
+      const srcDimBase = inputDim || inputVector.length || 1;
+      const srcDim =
+        architecture === 'cnn' ? effectiveInputDim || inputVector.length || srcDimBase : srcDimBase;
+      const L = architecture === 'cnn' ? srcDim : Math.min(srcDim, cap);
+      const baseVec =
+        inputVector.length >= L
+          ? inputVector.slice(0, L)
+          : Array.from({ length: L }, () => inputValue);
 
-        return { inVec, outVec };
+      // For input layers we only really use outVec; x(in) row is hidden in the UI.
+      return { inVec: baseVec, outVec: baseVec };
+    }
+
+    // CNN: build a simple per-layer forward pipeline over nodes so different conv/activation
+    // layers see different inputs/outputs.
+    if (architecture === 'cnn' && effectiveLayerLabel) {
+      const side = Math.max(4, Math.min(8, inputDim || 4));
+      const total = side * side;
+
+      const baseInput =
+        inputVector.length >= total
+          ? inputVector.slice(0, total)
+          : (() => {
+              const pad = Array.from({ length: total - inputVector.length }, () => inputValue);
+              return [...inputVector, ...pad];
+            })();
+
+      // Sort nodes by layer index so we walk them in forward order.
+      const ordered = [...nodes].sort((a, b) => {
+        const ia = parseInt(String(a.id).replace('layer-', ''), 10);
+        const ib = parseInt(String(b.id).replace('layer-', ''), 10);
+        if (Number.isNaN(ia) || Number.isNaN(ib)) return 0;
+        return ia - ib;
+      });
+
+      let map: number[] = baseInput;
+
+      for (const node of ordered) {
+        const data = node.data as { label?: string; details?: LayerDetails };
+        const label = data?.label ?? node.id;
+        const details = data?.details;
+
+        const before = map;
+        let after = before;
+
+        if (details) {
+          if (label.startsWith('Conv')) {
+            const params = (details.params || {}) as Record<string, ParamInfo>;
+            const wInfo = params.W;
+            const bInfo = params.b;
+            const w = wInfo && wInfo.value_sample && wInfo.value_sample.length
+              ? wInfo.value_sample[0]
+              : 1;
+            const b = bInfo && bInfo.value_sample && bInfo.value_sample.length
+              ? bInfo.value_sample[0]
+              : 0;
+            after = before.map((v) => w * v + b);
+          } else if (label.startsWith('ReLU')) {
+            after = before.map((v) => (v < 0 ? 0 : v));
+          } else if (label.startsWith('Tanh')) {
+            after = before.map((v) => Math.tanh(v));
+          } else if (label.startsWith('Sigmoid')) {
+            after = before.map((v) => 1 / (1 + Math.exp(-v)));
+          } else {
+            // Other CNN layers: keep map unchanged for now.
+            after = before;
+          }
+        }
+
+        if (label === effectiveLayerLabel) {
+          return { inVec: before, outVec: after };
+        }
+
+        map = after;
       }
+    }
+
+    // Prefer true forward-pass samples from the engine whenever available for non-input layers
+    const inSample = activeLayerDetails.input_sample;
+    const outSample = activeLayerDetails.output_sample;
+
+    if ((inSample && inSample.length) || (outSample && outSample.length)) {
+      const inSource = inSample && inSample.length ? inSample : outSample ?? [];
+      const outSource = outSample && outSample.length ? outSample : inSample ?? [];
+
+      const inVec = inSource.slice(0, cap);
+      const outVec = outSource.slice(0, cap);
+
+      return { inVec, outVec };
     }
 
     // Fallback: synthetic vectors based on shapes and forward_mean
@@ -408,7 +532,15 @@ export default function App() {
     }
 
     return { inVec, outVec };
-  }, [activeLayerDetails, effectiveLayerLabel, architecture, inputVector]);
+  }, [
+    activeLayerDetails,
+    effectiveLayerLabel,
+    architecture,
+    inputVector,
+    inputDim,
+    inputValue,
+    nodes,
+  ]);
 
   const renderVector = useCallback(
     (vec: number[]) => {
@@ -491,9 +623,26 @@ export default function App() {
 
     const isMLPInput = architecture === 'mlp' && getLabel(inputNode).startsWith('Input');
 
-    // Prefer real samples for MLP if available
+    const inputLabel = getLabel(inputNode);
+    const isInputLikeNode =
+      inputLabel.startsWith('Input') ||
+      inputLabel.startsWith('Input Seq') ||
+      inputLabel.startsWith('Token') ||
+      inputLabel.startsWith('Positional');
+
+    // Prefer editable inputVector for input-like nodes so the IO bar matches the slider
     let inVec: number[];
-    if (architecture === 'mlp' && inDetails.output_sample && inDetails.output_sample.length) {
+    if (isInputLikeNode) {
+      const srcDimBase = inputDim || inputVector.length || lenIn || 1;
+      const srcDim =
+        architecture === 'cnn' ? effectiveInputDim || inputVector.length || srcDimBase : srcDimBase;
+      const L = architecture === 'cnn' ? srcDim : Math.min(srcDim, cap);
+      const src =
+        inputVector.length >= L
+          ? inputVector
+          : Array.from({ length: srcDim }, () => inputValue);
+      inVec = src.slice(0, L);
+    } else if (inDetails.output_sample && inDetails.output_sample.length) {
       inVec = inDetails.output_sample.slice(0, cap);
     } else if (isMLPInput) {
       const L = Math.min(inputVector.length || lenIn || 4, cap);
@@ -506,7 +655,7 @@ export default function App() {
     }
 
     let outVec: number[];
-    if (architecture === 'mlp' && outDetails.output_sample && outDetails.output_sample.length) {
+    if (outDetails.output_sample && outDetails.output_sample.length) {
       outVec = outDetails.output_sample.slice(0, cap);
     } else {
       const outCenter = outDetails.forward_mean ?? 0;
@@ -518,6 +667,15 @@ export default function App() {
       outputLabel: getLabel(outputNode) || 'Output',
       inVec,
       outVec,
+      inShape: inDetails.out_shape,
+      outShape: outDetails.out_shape,
+    } as {
+      inputLabel: string;
+      outputLabel: string;
+      inVec: number[];
+      outVec: number[];
+      inShape?: number[] | string;
+      outShape?: number[] | string;
     };
   }, [nodes, architecture, inputVector]);
 
@@ -525,7 +683,7 @@ export default function App() {
     (index: number, value: number) => {
       const clamped = Math.max(-1, Math.min(1, value));
       setInputVector((prev) => {
-        const dim = inputDim || prev.length || 1;
+        const dim = effectiveInputDim || prev.length || 1;
         const next = Array.from({ length: dim }, (_, i) =>
           i === index ? clamped : prev[i] ?? 0,
         );
@@ -535,7 +693,7 @@ export default function App() {
         return next;
       });
     },
-    [inputDim],
+    [inputDim, effectiveInputDim],
   );
 
   const handleParamValueChange = useCallback(
@@ -816,18 +974,24 @@ export default function App() {
             />
           </div>
           <div className="flex items-center gap-2 px-3">
-            <span className="text-xs text-slate-400">Input Dim:</span>
+            <span className="text-xs text-slate-400">
+              {architecture === 'cnn' ? 'Input Dim (H=W):' : 'Input Dim:'}
+            </span>
             <input
               type="number"
               value={inputDim}
-              min={1}
-              max={16}
+              min={architecture === 'cnn' ? 4 : 1}
+              max={architecture === 'cnn' ? 8 : 16}
               onChange={(e) => {
                 const raw = Number(e.target.value) || 1;
-                const dim = Math.max(1, Math.min(16, raw));
-                setInputDim(dim);
+                const minDim = architecture === 'cnn' ? 4 : 1;
+                const maxDim = architecture === 'cnn' ? 8 : 16;
+                const side = Math.max(minDim, Math.min(maxDim, raw));
+                setInputDim(side);
+
+                const dimForVector = architecture === 'cnn' ? side * side : side;
                 setInputVector((prev) => {
-                  const next = Array.from({ length: dim }, (_, i) => prev[i] ?? 0.5);
+                  const next = Array.from({ length: dimForVector }, (_, i) => prev[i] ?? 0.5);
                   const mean =
                     next.length > 0
                       ? next.reduce((a, b) => a + b, 0) / next.length
@@ -836,7 +1000,7 @@ export default function App() {
                   return next;
                 });
               }}
-              className="w-12 bg-slate-700 border border-slate-600 rounded px-1 text-sm"
+              className="w-16 bg-slate-700 border border-slate-600 rounded px-1 text-sm"
             />
           </div>
           <div className="flex items-center gap-2 px-3">
@@ -878,14 +1042,6 @@ export default function App() {
             </select>
           </div>
           <button
-            onClick={runSimulation}
-            disabled={loading}
-            className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-1.5 rounded-md text-sm font-medium flex items-center gap-2 transition-colors disabled:opacity-50"
-          >
-            <Play size={14} />
-            {loading ? 'Computing...' : 'Simulate'}
-          </button>
-          <button
             type="button"
             onClick={() => {
               setInitMode('random');
@@ -897,6 +1053,25 @@ export default function App() {
             className="bg-slate-700 hover:bg-slate-600 text-white px-3 py-1.5 rounded-md text-xs font-medium border border-slate-500"
           >
             Randomize params
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              const dim = effectiveInputDim || inputDim || inputVector.length || 1;
+              const rand = () => Math.random() * 2 - 1; // [-1,1]
+              setInputVector(() => {
+                const next = Array.from({ length: dim }, () => rand());
+                const mean =
+                  next.length > 0
+                    ? next.reduce((a, b) => a + b, 0) / next.length
+                    : 0;
+                setInputValue(mean);
+                return next;
+              });
+            }}
+            className="bg-slate-700 hover:bg-slate-600 text-white px-3 py-1.5 rounded-md text-xs font-medium border border-slate-500"
+          >
+            Randomize x
           </button>
         </div>
       </div>
@@ -926,7 +1101,34 @@ export default function App() {
                 );
               }}
               onMouseLeave={() => {
-                if (!pinnedNodeId) {
+                if (pinnedNodeId) {
+                  // Restore pinned node overlay when leaving the param bar.
+                  const pinned = nodes.find((n) => n.id === pinnedNodeId);
+                  const data = pinned?.data as { label?: string; details?: LayerDetails } | undefined;
+
+                  if (pinned) {
+                    highlightPathTo(pinnedNodeId);
+                  } else {
+                    highlightPathTo(null);
+                  }
+
+                  setActiveParam(null);
+                  setActiveLayerLabel(data?.label ?? null);
+                  setActiveLayerDetails(data?.details ?? null);
+
+                  if (data && data.details && data.details.params) {
+                    const chips: ParamChip[] = Object.keys(data.details.params).map((paramName) => ({
+                      id: `${pinnedNodeId}-${paramName}`,
+                      nodeId: pinnedNodeId,
+                      layerLabel: data.label ?? pinnedNodeId,
+                      paramName,
+                    }));
+                    setActiveNodeParams(chips);
+                  } else {
+                    setActiveNodeParams(null);
+                  }
+                } else {
+                  // No pin: clear overlay when leaving param bar.
                   highlightPathTo(null);
                   setActiveParam(null);
                   setActiveNodeParams(null);
@@ -979,17 +1181,16 @@ export default function App() {
                     : info.value_sample && info.value_sample.length
                     ? info.value_sample.length
                     : 1;
+                  const hasSample = info.value_sample && info.value_sample.length;
 
-                  const baseVals =
-                    info.value_sample && info.value_sample.length
-                      ? info.value_sample
-                      : [0];
-
-                  if (baseVals.length === total) {
-                    flatVals = [...baseVals];
+                  if (hasSample && info.value_sample!.length >= total) {
+                    // Use engine-provided samples directly (e.g. real MLP weights)
+                    flatVals = info.value_sample!.slice(0, total);
                   } else {
-                    const seed = baseVals[0] ?? 0;
-                    flatVals = Array.from({ length: total }, () => seed);
+                    // For conceptual params (CNN/RNN/Transformer) or missing samples,
+                    // seed the grid with random values so entries are visibly colored.
+                    const rand = () => Math.random() * 2 - 1; // ~Uniform(-1,1)
+                    flatVals = Array.from({ length: total }, () => rand());
                   }
                 } else {
                   shape = [1];
@@ -1024,7 +1225,54 @@ export default function App() {
             <span className="uppercase tracking-wider text-slate-500 flex-shrink-0">
               {ioVectors.inputLabel} vector
             </span>
-            {renderVector(ioVectors.inVec)}
+            {architecture === 'cnn' &&
+            viewMode === 'blocks' &&
+            ioVectors.inShape &&
+            Array.isArray(ioVectors.inShape) &&
+            (ioVectors.inShape as number[]).length >= 2 ? (
+              (() => {
+                const vec = ioVectors.inVec;
+                const total = Math.max(1, vec.length);
+                const shape = ioVectors.inShape as number[];
+                let H = 1;
+                let W = total;
+                if (shape.length >= 3) {
+                  H = shape[shape.length - 2] ?? total;
+                  W = shape[shape.length - 1] ?? 1;
+                } else if (shape.length === 2) {
+                  H = shape[0] ?? total;
+                  W = shape[1] ?? 1;
+                }
+                H = Math.max(1, Math.min(8, H));
+                W = Math.max(1, Math.min(8, W));
+
+                const cells: JSX.Element[] = [];
+                for (let r = 0; r < H; r++) {
+                  for (let c = 0; c < W; c++) {
+                    const idx = r * W + c;
+                    const v = vec.length ? vec[idx % vec.length] : 0;
+                    cells.push(
+                      <div
+                        key={idx}
+                        className="w-3 h-3 rounded-sm"
+                        style={{ backgroundColor: valueToColor(v) }}
+                      />,
+                    );
+                  }
+                }
+
+                return (
+                  <div
+                    className="grid gap-[2px]"
+                    style={{ gridTemplateColumns: `repeat(${W}, minmax(0, 1fr))` }}
+                  >
+                    {cells}
+                  </div>
+                );
+              })()
+            ) : (
+              renderVector(ioVectors.inVec)
+            )}
           </div>
           <div className="flex items-center gap-2">
             <span className="uppercase tracking-wider text-slate-500 flex-shrink-0">
@@ -1060,75 +1308,202 @@ export default function App() {
         </div>
       )}
 
-      {(activeChainRules.length > 0 || overlayBackSignal || overlayActivations) && (
+      {(activeLayerLabel || pinnedNodeId || activeParam || (activeNodeParams && activeNodeParams.length > 0)) &&
+        (activeChainRules.length > 0 || overlayBackSignal || overlayActivations) && (
         <div className="pointer-events-none absolute top-40 left-4 z-30">
           <div className="pointer-events-auto max-w-[60vw] max-h-[60vh] rounded-lg border border-slate-700 bg-slate-900/95 px-4 py-2 text-xs shadow-xl flex flex-col gap-1 justify-start overflow-y-auto">
             <span className="uppercase tracking-wider text-slate-500 text-[10px] flex-shrink-0 text-left">
-              Chain rule
+              More info
             </span>
-            {overlayBackSignal && (
-              <div className="mt-1 flex items-center gap-3 justify-start text-slate-100">
-                <span className="uppercase tracking-wider text-slate-400 text-[10px]">
-                  backprop to prev
-                </span>
-                <span className="flex items-center gap-1 font-mono text-sm">
-                  <span className="text-slate-400">←</span>
-                  <span className="text-[13px]">
-                    <Latex>{`$$ ${overlayBackSignal} $$`}</Latex>
-                  </span>
-                </span>
+            {effectiveLayerLabel && (
+              <div className="text-[10px] text-slate-400 font-mono">
+                Layer: <span className="text-slate-200">{effectiveLayerLabel}</span>
               </div>
             )}
             {overlayActivations && (
               <div className="mt-1 space-y-1 text-[10px] text-slate-300 font-mono">
-                {!(effectiveLayerLabel && effectiveLayerLabel.startsWith('Input')) && (
+                {! (
+                  effectiveLayerLabel &&
+                  (effectiveLayerLabel.startsWith('Input') ||
+                    effectiveLayerLabel.startsWith('Input Seq') ||
+                    effectiveLayerLabel.startsWith('Token') ||
+                    effectiveLayerLabel.startsWith('Positional'))
+                ) && (
                   <div className="flex items-center gap-2">
                     <span className="text-slate-500">x (in):</span>
-                    {renderVector(overlayActivations.inVec)}
+                    {architecture === 'cnn' &&
+                    viewMode === 'blocks' &&
+                    activeLayerDetails &&
+                    Array.isArray(activeLayerDetails.in_shape) &&
+                    activeLayerDetails.in_shape.length >= 2 ? (
+                      (() => {
+                        const vec = overlayActivations.inVec;
+                        const total = Math.max(1, vec.length);
+                        const shape = activeLayerDetails.in_shape as number[];
+                        let H = 1;
+                        let W = total;
+                        if (shape.length >= 3) {
+                          H = shape[shape.length - 2] ?? total;
+                          W = shape[shape.length - 1] ?? 1;
+                        } else if (shape.length === 2) {
+                          H = shape[0] ?? total;
+                          W = shape[1] ?? 1;
+                        }
+                        H = Math.max(1, Math.min(8, H));
+                        W = Math.max(1, Math.min(8, W));
+
+                        const cells: JSX.Element[] = [];
+                        for (let r = 0; r < H; r++) {
+                          for (let c = 0; c < W; c++) {
+                            const idx = r * W + c;
+                            const v = vec.length ? vec[idx % vec.length] : 0;
+                            cells.push(
+                              <div
+                                key={idx}
+                                className="w-3 h-3 rounded-sm"
+                                style={{ backgroundColor: valueToColor(v) }}
+                              />,
+                            );
+                          }
+                        }
+                        return (
+                          <div
+                            className="grid gap-[2px]"
+                            style={{ gridTemplateColumns: `repeat(${W}, minmax(0, 1fr))` }}
+                          >
+                            {cells}
+                          </div>
+                        );
+                      })()
+                    ) : (
+                      renderVector(overlayActivations.inVec)
+                    )}
                   </div>
                 )}
                 <div className="flex items-center gap-2">
                   <span className="text-slate-500">
-                    {effectiveLayerLabel && effectiveLayerLabel.startsWith('Input') ? 'x:' : 'y (out):'}
+                    {effectiveLayerLabel &&
+                    (effectiveLayerLabel.startsWith('Input') ||
+                      effectiveLayerLabel.startsWith('Input Seq') ||
+                      effectiveLayerLabel.startsWith('Token') ||
+                      effectiveLayerLabel.startsWith('Positional'))
+                      ? 'x:'
+                      : 'y (out):'}
                   </span>
-                  {renderVector(overlayActivations.outVec)}
+                  {architecture === 'cnn' &&
+                  viewMode === 'blocks' &&
+                  activeLayerDetails &&
+                  Array.isArray(activeLayerDetails.out_shape) &&
+                  activeLayerDetails.out_shape.length >= 2 ? (
+                    (() => {
+                      const vec = overlayActivations.outVec;
+                      const total = Math.max(1, vec.length);
+                      const shape = activeLayerDetails.out_shape as number[];
+                      let H = 1;
+                      let W = total;
+                      if (shape.length >= 3) {
+                        H = shape[shape.length - 2] ?? total;
+                        W = shape[shape.length - 1] ?? 1;
+                      } else if (shape.length === 2) {
+                        H = shape[0] ?? total;
+                        W = shape[1] ?? 1;
+                      }
+                      H = Math.max(1, Math.min(8, H));
+                      W = Math.max(1, Math.min(8, W));
+
+                      const cells: JSX.Element[] = [];
+                      for (let r = 0; r < H; r++) {
+                        for (let c = 0; c < W; c++) {
+                          const idx = r * W + c;
+                          const v = vec.length ? vec[idx % vec.length] : 0;
+                          cells.push(
+                            <div
+                              key={idx}
+                              className="w-3 h-3 rounded-sm"
+                              style={{ backgroundColor: valueToColor(v) }}
+                            />,
+                          );
+                        }
+                      }
+                      return (
+                        <div
+                          className="grid gap-[2px]"
+                          style={{ gridTemplateColumns: `repeat(${W}, minmax(0, 1fr))` }}
+                        >
+                          {cells}
+                        </div>
+                      );
+                    })()
+                  ) : (
+                    renderVector(overlayActivations.outVec)
+                  )}
                 </div>
-                {effectiveLayerLabel && effectiveLayerLabel.startsWith('Input') && architecture === 'mlp' && (
+                {effectiveLayerLabel &&
+                  (effectiveLayerLabel.startsWith('Input') ||
+                    effectiveLayerLabel.startsWith('Input Seq') ||
+                    effectiveLayerLabel.startsWith('Token') ||
+                    effectiveLayerLabel.startsWith('Positional')) && (
                   <div className="mt-2 space-y-1">
                     <div className="flex items-center justify-between">
-                      <span className="text-slate-500">Input vector (d = {inputDim}):</span>
+                      <span className="text-slate-500">Input vector (d = {effectiveInputDim ?? inputDim}):</span>
                       <span className="text-slate-400 font-mono text-[10px]">
                         mean = {inputValue.toFixed(3)}
                       </span>
                     </div>
                     <div className="max-h-32 overflow-y-auto pr-1">
-                      <div className="flex flex-wrap gap-[4px]">
-                        {Array.from({ length: inputDim }).map((_, i) => {
-                          const v = inputVector[i] ?? 0;
-                          const isActive = activeInputIndex === i;
-                          return (
-                            <button
-                              key={i}
-                              type="button"
-                              className={`w-4 h-4 rounded-sm border ${
-                                isActive
-                                  ? 'ring-2 ring-blue-400 ring-offset-1 ring-offset-slate-900 border-transparent'
-                                  : 'border-slate-600'
-                              }`}
-                              style={{ backgroundColor: valueToColor(v) }}
-                              onMouseEnter={() => setHoveredInputIndex(i)}
-                              onMouseLeave={() =>
-                                setHoveredInputIndex((prev) => (prev === i ? null : prev))
-                              }
-                              onClick={() =>
-                                setPinnedInputIndex((prev) => (prev === i ? null : i))
-                              }
-                            />
-                          );
-                        })}
-                      </div>
+                      {(() => {
+                        const dim = effectiveInputDim || inputDim || 1;
+                        const total = dim;
+                        let rows = 1;
+                        let cols = total;
+
+                        if (architecture === 'cnn') {
+                          const size = Math.max(1, Math.floor(Math.sqrt(total)));
+                          rows = size;
+                          cols = size;
+                        }
+
+                        const cells: JSX.Element[] = [];
+                        for (let r = 0; r < rows; r++) {
+                          for (let c = 0; c < cols; c++) {
+                            const i = r * cols + c;
+                            if (i >= total) break;
+                            const v = inputVector[i] ?? 0;
+                            const isActive = activeInputIndex === i;
+                            cells.push(
+                              <button
+                                key={i}
+                                type="button"
+                                className={`w-4 h-4 rounded-sm border ${
+                                  isActive
+                                    ? 'ring-2 ring-blue-400 ring-offset-1 ring-offset-slate-900 border-transparent'
+                                    : 'border-slate-600'
+                                }`}
+                                style={{ backgroundColor: valueToColor(v) }}
+                                onMouseEnter={() => setHoveredInputIndex(i)}
+                                onMouseLeave={() =>
+                                  setHoveredInputIndex((prev) => (prev === i ? null : prev))
+                                }
+                                onClick={() =>
+                                  setPinnedInputIndex((prev) => (prev === i ? null : i))
+                                }
+                              />,
+                            );
+                          }
+                        }
+
+                        return (
+                          <div
+                            className="grid gap-[4px]"
+                            style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}
+                          >
+                            {cells}
+                          </div>
+                        );
+                      })()}
                     </div>
-                    {activeInputIndex !== null && activeInputIndex < inputDim && (
+                    {activeInputIndex !== null &&
+                      activeInputIndex < (effectiveInputDim || inputDim) && (
                       <div className="mt-2 flex items-center gap-2">
                         <span className="w-10 text-slate-500 font-mono">x{activeInputIndex}</span>
                         <input
@@ -1149,6 +1524,19 @@ export default function App() {
                     )}
                   </div>
                 )}
+              </div>
+            )}
+            {overlayBackSignal && (
+              <div className="mt-2 flex items-center gap-3 justify-start text-slate-100">
+                <span className="uppercase tracking-wider text-slate-400 text-[10px]">
+                  backprop to prev
+                </span>
+                <span className="flex items-center gap-1 font-mono text-sm">
+                  <span className="text-slate-400">←</span>
+                  <span className="text-[13px]">
+                    <Latex>{`$$ ${overlayBackSignal} $$`}</Latex>
+                  </span>
+                </span>
               </div>
             )}
             {activeChainRules.map(({ chip, latex }) => (
@@ -1473,23 +1861,9 @@ export default function App() {
             };
             const isAlreadyPinned = pinnedNodeId === node.id;
 
-            // If this node is already pinned, keep the overlay as-is
             if (isAlreadyPinned) {
-              // Optionally refresh details in case params changed
-              highlightPathTo(node.id);
-              setActiveLayerLabel(data?.label ?? node.id);
-              setActiveLayerDetails(data?.details ?? null);
-              if (data && data.details && data.details.params) {
-                const chips: ParamChip[] = Object.keys(data.details.params).map((paramName) => ({
-                  id: `${node.id}-${paramName}`,
-                  nodeId: node.id,
-                  layerLabel: data.label ?? node.id,
-                  paramName,
-                }));
-                setActiveNodeParams(chips);
-              } else {
-                setActiveNodeParams(null);
-              }
+              // Toggle off: unpin, but keep current hover-based overlay state.
+              setPinnedNodeId(null);
               return;
             }
 
@@ -1511,9 +1885,6 @@ export default function App() {
             }
           }}
           onNodeMouseEnter={(_, node) => {
-            if (pinnedNodeId && pinnedNodeId === node.id) {
-              return;
-            }
             highlightPathTo(node.id);
             const data = node.data as {
               label?: string;
@@ -1534,13 +1905,38 @@ export default function App() {
             }
           }}
           onNodeMouseLeave={(_, node) => {
-            if (pinnedNodeId && pinnedNodeId === node.id) {
-              return;
+            if (pinnedNodeId) {
+              // Restore overlay state for pinned node when cursor leaves any node.
+              const pinned = nodes.find((n) => n.id === pinnedNodeId);
+              const data = pinned?.data as { label?: string; details?: LayerDetails } | undefined;
+
+              if (pinned) {
+                highlightPathTo(pinnedNodeId);
+              } else {
+                highlightPathTo(null);
+              }
+
+              setActiveLayerLabel(data?.label ?? null);
+              setActiveLayerDetails(data?.details ?? null);
+
+              if (data && data.details && data.details.params) {
+                const chips: ParamChip[] = Object.keys(data.details.params).map((paramName) => ({
+                  id: `${pinnedNodeId}-${paramName}`,
+                  nodeId: pinnedNodeId,
+                  layerLabel: data.label ?? pinnedNodeId,
+                  paramName,
+                }));
+                setActiveNodeParams(chips);
+              } else {
+                setActiveNodeParams(null);
+              }
+            } else {
+              // No pin: clear overlay when cursor leaves nodes.
+              highlightPathTo(null);
+              setActiveNodeParams(null);
+              setActiveLayerLabel(null);
+              setActiveLayerDetails(null);
             }
-            highlightPathTo(null);
-            setActiveNodeParams(null);
-            setActiveLayerLabel(null);
-            setActiveLayerDetails(null);
           }}
           fitView
           minZoom={0.1}

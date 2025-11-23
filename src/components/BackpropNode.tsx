@@ -6,6 +6,28 @@ import 'katex/dist/katex.min.css';
 
 import type { LayerDetails } from '../engine';
 
+function valueToColor(v: number): string {
+  const clamp = (x: number) => Math.max(-1, Math.min(1, x));
+  const x = clamp(v);
+
+  const neutral = { r: 15, g: 23, b: 42 };
+  const pos = { r: 34, g: 197, b: 94 };
+  const neg = { r: 248, g: 113, b: 113 };
+
+  const mix = (a: typeof neutral, b: typeof neutral, t: number) => ({
+    r: a.r + (b.r - a.r) * t,
+    g: a.g + (b.g - a.g) * t,
+    b: a.b + (b.b - a.b) * t,
+  });
+
+  if (x >= 0) {
+    const c = mix(neutral, pos, x);
+    return `rgb(${Math.round(c.r)}, ${Math.round(c.g)}, ${Math.round(c.b)})`;
+  }
+  const c = mix(neutral, neg, -x);
+  return `rgb(${Math.round(c.r)}, ${Math.round(c.g)}, ${Math.round(c.b)})`;
+}
+
 const EQ_MAP: Record<string, string> = {
   // MLP
   Input: '\\mathbf{x} \\in \\mathbb{R}^{d_{in}}',
@@ -116,12 +138,24 @@ export default function BackpropNode({ data, selected }: NodeProps<BackpropNodeD
 
   useEffect(() => {
     if (!label.startsWith('Conv')) return;
-    const totalPositions = 4; // valid 3x3 windows in a 4x4 grid: (0,0), (0,1), (1,0), (1,1)
+
+    let Hin = 4;
+    let Win = 4;
+    if (Array.isArray(details.in_shape) && details.in_shape.length >= 3) {
+      const shape = details.in_shape as number[];
+      Hin = Math.min(8, Math.max(3, shape[shape.length - 2] ?? 4));
+      Win = Math.min(8, Math.max(3, shape[shape.length - 1] ?? 4));
+    }
+
+    const maxR0 = Math.max(1, Hin - 2);
+    const maxC0 = Math.max(1, Win - 2);
+    const totalPositions = Math.max(1, maxR0 * maxC0);
+
     const id = window.setInterval(() => {
       setConvStep((s) => (s + 1) % totalPositions);
     }, 900);
     return () => window.clearInterval(id);
-  }, [label]);
+  }, [label, details.in_shape]);
 
   useEffect(() => {
     setAttnHead(0);
@@ -249,14 +283,38 @@ export default function BackpropNode({ data, selected }: NodeProps<BackpropNodeD
             </span>
           </div>
           <div className="flex justify-center">
-            <div className="grid grid-cols-4 gap-[2px]">
-              {Array.from({ length: 16 }).map((_, i) => (
+            {(() => {
+              const shape = Array.isArray(details.out_shape)
+                ? (details.out_shape as number[])
+                : [1, 4, 4];
+              const H = Math.max(1, Math.min(8, shape[1] ?? 4));
+              const W = Math.max(1, Math.min(8, shape[2] ?? 4));
+              const vals = (details.output_sample as number[]) || [];
+
+              const cells: JSX.Element[] = [];
+              for (let r = 0; r < H; r++) {
+                for (let c = 0; c < W; c++) {
+                  const idx = r * W + c;
+                  const v = vals.length ? vals[idx % vals.length] : 0;
+                  cells.push(
+                    <div
+                      key={idx}
+                      className="w-3 h-3 rounded-sm border border-slate-700"
+                      style={{ backgroundColor: valueToColor(v) }}
+                    />,
+                  );
+                }
+              }
+
+              return (
                 <div
-                  key={i}
-                  className="w-3 h-3 rounded-sm border border-slate-700 bg-slate-800"
-                />
-              ))}
-            </div>
+                  className="grid gap-[2px]"
+                  style={{ gridTemplateColumns: `repeat(${W}, minmax(0, 1fr))` }}
+                >
+                  {cells}
+                </div>
+              );
+            })()}
           </div>
         </div>
       )}
@@ -296,49 +354,107 @@ export default function BackpropNode({ data, selected }: NodeProps<BackpropNodeD
       {isConv && (
         <div className="mb-2">
           <div className="flex justify-between items-center mb-1">
-            <span className="text-[10px] font-bold text-sky-400 uppercase tracking-wider">Conv window</span>
+            <span className="text-[10px] font-bold text-sky-400 uppercase tracking-wider">Conv maps</span>
             {Array.isArray(details.in_shape) && details.in_shape.length === 3 && (
               <span className="text-[9px] text-slate-400 font-mono">
-                {details.in_shape[0]}×{details.in_shape[1]}×{details.in_shape[2]}
+                in: {details.in_shape[1]}×{details.in_shape[2]} · out:
+                {Array.isArray(details.out_shape) && details.out_shape.length === 3
+                  ? ` ${details.out_shape[1]}×${details.out_shape[2]}`
+                  : ' ?×?'}
               </span>
             )}
           </div>
-          <div className="flex items-center gap-3">
-            <div className="grid grid-cols-4 gap-[2px]">
-              {Array.from({ length: 16 }).map((_, i) => {
-                const row = Math.floor(i / 4);
-                const col = i % 4;
-                const positions: Array<[number, number]> = [
-                  [0, 0],
-                  [0, 1],
-                  [1, 0],
-                  [1, 1],
-                ];
-                const [r0, c0] = positions[convStep] ?? positions[0];
-                const inKernel = row >= r0 && row <= r0 + 2 && col >= c0 && col <= c0 + 2;
-                return (
-                  <div
-                    key={i}
-                    className={`w-3 h-3 rounded-sm border ${
-                      inKernel
-                        ? 'border-amber-400 bg-amber-500/70'
-                        : 'border-slate-700 bg-slate-800'
-                    }`}
-                  />
-                );
-              })}
-            </div>
-            <div className="flex flex-col items-center gap-1">
-              <span className="text-[9px] text-slate-400 font-mono">kernel</span>
-              <div className="grid grid-cols-3 gap-[2px]">
-                {Array.from({ length: 9 }).map((_, i) => (
-                  <div
-                    key={i}
-                    className="w-3 h-3 rounded-sm border border-amber-400 bg-amber-500/80"
-                  />
-                ))}
-              </div>
-            </div>
+          <div className="flex items-center gap-4">
+            {(() => {
+              let Hin = 4;
+              let Win = 4;
+              if (Array.isArray(details.in_shape) && details.in_shape.length === 3) {
+                Hin = Math.min(8, Math.max(2, details.in_shape[1] ?? 4));
+                Win = Math.min(8, Math.max(2, details.in_shape[2] ?? 4));
+              }
+
+              let Hout = 4;
+              let Wout = 4;
+              if (Array.isArray(details.out_shape) && details.out_shape.length === 3) {
+                Hout = Math.min(8, Math.max(2, details.out_shape[1] ?? 4));
+                Wout = Math.min(8, Math.max(2, details.out_shape[2] ?? 4));
+              }
+
+              const inputCells: JSX.Element[] = [];
+              const outputCells: JSX.Element[] = [];
+
+              // Compute top-left of the 3x3 kernel from convStep so it sweeps the whole map.
+              const maxR0 = Math.max(1, Hin - 2);
+              const maxC0 = Math.max(1, Win - 2);
+              const r0 = Math.floor(convStep % (maxR0 * maxC0) / maxC0);
+              const c0 = convStep % maxC0;
+
+              for (let r = 0; r < Hin; r++) {
+                for (let c = 0; c < Win; c++) {
+                  const inKernel = r >= r0 && r <= r0 + 2 && c >= c0 && c <= c0 + 2;
+                  inputCells.push(
+                    <div
+                      key={`in-${r}-${c}`}
+                      className={`w-3 h-3 rounded-sm border ${
+                        inKernel
+                          ? 'border-amber-400 bg-amber-500/70'
+                          : 'border-slate-700 bg-slate-800'
+                      }`}
+                    />,
+                  );
+                }
+              }
+
+              for (let r = 0; r < Hout; r++) {
+                for (let c = 0; c < Wout; c++) {
+                  const isActive = r === r0 && c === c0;
+                  outputCells.push(
+                    <div
+                      key={`out-${r}-${c}`}
+                      className={`w-3 h-3 rounded-sm border ${
+                        isActive
+                          ? 'border-emerald-400 bg-emerald-500/80'
+                          : 'border-slate-700 bg-slate-800'
+                      }`}
+                    />,
+                  );
+                }
+              }
+
+              return (
+                <>
+                  <div>
+                    <span className="text-[9px] text-slate-400 font-mono">input</span>
+                    <div
+                      className="mt-1 grid gap-[2px]"
+                      style={{ gridTemplateColumns: `repeat(${Win}, minmax(0, 1fr))` }}
+                    >
+                      {inputCells}
+                    </div>
+                  </div>
+                  <div className="flex flex-col items-center gap-1">
+                    <span className="text-[9px] text-slate-400 font-mono">kernel</span>
+                    <div className="grid grid-cols-3 gap-[2px]">
+                      {Array.from({ length: 9 }).map((_, i) => (
+                        <div
+                          key={i}
+                          className="w-3 h-3 rounded-sm border border-amber-400 bg-amber-500/80"
+                        />
+                      ))}
+                    </div>
+                  </div>
+                  <div>
+                    <span className="text-[9px] text-slate-400 font-mono">output</span>
+                    <div
+                      className="mt-1 grid gap-[2px]"
+                      style={{ gridTemplateColumns: `repeat(${Wout}, minmax(0, 1fr))` }}
+                    >
+                      {outputCells}
+                    </div>
+                  </div>
+                </>
+              );
+            })()}
           </div>
           <div className="mt-1 text-[9px] text-slate-500 font-mono">kernel slides across spatial grid</div>
         </div>

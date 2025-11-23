@@ -173,12 +173,19 @@ function makeParam(shape: number[]): ParamInfo {
   };
 }
 
-function computeTinyConvStats(initMode?: InitMode, initValue?: number): {
+function computeTinyConvStats(
+  initMode?: InitMode,
+  initValue?: number,
+  overrideW?: number,
+  overrideB?: number,
+): {
   forwardMean: number;
   wGradMean: number;
   bGradMean: number;
   wSample: number;
   bSample: number;
+  xSample: number[];
+  ySample: number[];
 } {
   const mode = initMode ?? 'random';
   const base = initValue ?? 0;
@@ -190,11 +197,13 @@ function computeTinyConvStats(initMode?: InitMode, initValue?: number): {
 
   const ws: Value[] = [];
   for (let i = 0; i < 9; i++) {
-    const wVal = mode === 'constant' ? base : (Math.random() - 0.5) * 0.1;
+    const defaultW = mode === 'constant' ? base : (Math.random() - 0.5) * 0.1;
+    const wVal = overrideW !== undefined ? overrideW : defaultW;
     ws.push(new Value(wVal, [], 'Weight', 'W'));
   }
 
-  const bVal = mode === 'constant' ? base : 0.0;
+  const defaultB = mode === 'constant' ? base : 0.0;
+  const bVal = overrideB !== undefined ? overrideB : defaultB;
   const b = new Value(bVal, [], 'Bias', 'b');
 
   let y = new Value(0.0);
@@ -212,16 +221,27 @@ function computeTinyConvStats(initMode?: InitMode, initValue?: number): {
   const wGradMean = ws.reduce((s, w) => s + Math.abs(w.grad), 0) / ws.length;
   const bGradMean = Math.abs(b.grad);
 
+  const xSample = xs.map((v) => v.data);
+  const ySample = [y.data];
+
   return {
     forwardMean: y.data,
     wGradMean,
     bGradMean,
     wSample: ws[0]?.data ?? 0,
     bSample: b.data,
+    xSample,
+    ySample,
   };
 }
 
-function computeTinyRNNStats(initMode?: InitMode, initValue?: number): {
+function computeTinyRNNStats(
+  initMode?: InitMode,
+  initValue?: number,
+  overrideWx?: number,
+  overrideWh?: number,
+  overrideB?: number,
+): {
   forwardMean: number;
   wXGradMean: number;
   wHGradMean: number;
@@ -229,6 +249,10 @@ function computeTinyRNNStats(initMode?: InitMode, initValue?: number): {
   wXSample: number;
   wHSample: number;
   bSample: number;
+  xSample: number[];
+  hSample: number[];
+  ySample: number;
+  lossSample: number;
 } {
   const mode = initMode ?? 'random';
   const base = initValue ?? 0;
@@ -239,9 +263,13 @@ function computeTinyRNNStats(initMode?: InitMode, initValue?: number): {
     xs.push(new Value(0.5, [], 'Input', 'x_t'));
   }
 
-  const wXVal = mode === 'constant' ? base : (Math.random() - 0.5) * 0.1;
-  const wHVal = mode === 'constant' ? base : (Math.random() - 0.5) * 0.1;
-  const bVal = mode === 'constant' ? base : 0.0;
+  const defaultWx = mode === 'constant' ? base : (Math.random() - 0.5) * 0.1;
+  const defaultWh = mode === 'constant' ? base : (Math.random() - 0.5) * 0.1;
+  const defaultB = mode === 'constant' ? base : 0.0;
+
+  const wXVal = overrideWx !== undefined ? overrideWx : defaultWx;
+  const wHVal = overrideWh !== undefined ? overrideWh : defaultWh;
+  const bVal = overrideB !== undefined ? overrideB : defaultB;
 
   const W_x = new Value(wXVal, [], 'Weight', 'W_x');
   const W_h = new Value(wHVal, [], 'Weight', 'W_h');
@@ -264,6 +292,9 @@ function computeTinyRNNStats(initMode?: InitMode, initValue?: number): {
 
   const forwardMean = hs.reduce((s, h) => s + h.data, 0) / hs.length;
 
+  const xSample = xs.map((v) => v.data);
+  const hSample = hs.map((v) => v.data);
+
   return {
     forwardMean,
     wXGradMean: Math.abs(W_x.grad),
@@ -272,10 +303,21 @@ function computeTinyRNNStats(initMode?: InitMode, initValue?: number): {
     wXSample: W_x.data,
     wHSample: W_h.data,
     bSample: b.data,
+    xSample,
+    hSample,
+    ySample: y.data,
+    lossSample: loss.data,
   };
 }
 
-function computeTinySelfAttnStats(initMode?: InitMode, initValue?: number): {
+function computeTinySelfAttnStats(
+  initMode?: InitMode,
+  initValue?: number,
+  overrideWq?: number,
+  overrideWk?: number,
+  overrideWv?: number,
+  overrideWo?: number,
+): {
   forwardMean: number;
   wqGrad: number;
   wkGrad: number;
@@ -285,19 +327,30 @@ function computeTinySelfAttnStats(initMode?: InitMode, initValue?: number): {
   wkSample: number;
   wvSample: number;
   woSample: number;
+  inputSample: number[];
+  outputSample: number[];
 } {
   const mode = initMode ?? 'random';
   const base = initValue ?? 0;
 
   const x = new Value(0.5, [], 'Input', 'x');
 
-  const makeW = (label: string) =>
-    new Value(mode === 'constant' ? base : (Math.random() - 0.5) * 0.1, [], 'Weight', label);
+  const makeW = (label: string, override?: number) =>
+    new Value(
+      override !== undefined
+        ? override
+        : mode === 'constant'
+        ? base
+        : (Math.random() - 0.5) * 0.1,
+      [],
+      'Weight',
+      label,
+    );
 
-  const W_q = makeW('W_q');
-  const W_k = makeW('W_k');
-  const W_v = makeW('W_v');
-  const W_o = makeW('W_o');
+  const W_q = makeW('W_q', overrideWq);
+  const W_k = makeW('W_k', overrideWk);
+  const W_v = makeW('W_v', overrideWv);
+  const W_o = makeW('W_o', overrideWo);
 
   const q = x.mul(W_q);
   const k = x.mul(W_k);
@@ -322,10 +375,19 @@ function computeTinySelfAttnStats(initMode?: InitMode, initValue?: number): {
     wkSample: W_k.data,
     wvSample: W_v.data,
     woSample: W_o.data,
+    inputSample: [x.data],
+    outputSample: [y.data],
   };
 }
 
-function computeTinyFFNStats(initMode?: InitMode, initValue?: number): {
+function computeTinyFFNStats(
+  initMode?: InitMode,
+  initValue?: number,
+  overrideW1?: number,
+  overrideB1?: number,
+  overrideW2?: number,
+  overrideB2?: number,
+): {
   forwardMean: number;
   w1Grad: number;
   b1Grad: number;
@@ -335,21 +397,33 @@ function computeTinyFFNStats(initMode?: InitMode, initValue?: number): {
   b1Sample: number;
   w2Sample: number;
   b2Sample: number;
+  inputSample: number[];
+  hiddenSample: number[];
+  outputSample: number[];
 } {
   const mode = initMode ?? 'random';
   const base = initValue ?? 0;
 
   const x = new Value(0.5, [], 'Input', 'x');
 
-  const makeW = (label: string) =>
-    new Value(mode === 'constant' ? base : (Math.random() - 0.5) * 0.1, [], 'Weight', label);
-  const makeB = (label: string) =>
-    new Value(mode === 'constant' ? base : 0.0, [], 'Bias', label);
+  const makeW = (label: string, override?: number) =>
+    new Value(
+      override !== undefined
+        ? override
+        : mode === 'constant'
+        ? base
+        : (Math.random() - 0.5) * 0.1,
+      [],
+      'Weight',
+      label,
+    );
+  const makeB = (label: string, override?: number) =>
+    new Value(override !== undefined ? override : mode === 'constant' ? base : 0.0, [], 'Bias', label);
 
-  const W1 = makeW('W1');
-  const b1 = makeB('b1');
-  const W2 = makeW('W2');
-  const b2 = makeB('b2');
+  const W1 = makeW('W1', overrideW1);
+  const b1 = makeB('b1', overrideB1);
+  const W2 = makeW('W2', overrideW2);
+  const b2 = makeB('b2', overrideB2);
 
   const h = x.mul(W1).add(b1).tanh();
   const y = h.mul(W2).add(b2);
@@ -369,6 +443,9 @@ function computeTinyFFNStats(initMode?: InitMode, initValue?: number): {
     b1Sample: b1.data,
     w2Sample: W2.data,
     b2Sample: b2.data,
+    inputSample: [x.data],
+    hiddenSample: [h.data],
+    outputSample: [y.data],
   };
 }
 
@@ -415,6 +492,8 @@ function addSequentialNode(
   outShape: number[],
   params: Record<string, ParamInfo>,
   forwardMean: number,
+  inputSample?: number[],
+  outputSample?: number[],
 ) {
   const nodeId = `layer-${index}`;
   const details: LayerDetails = {
@@ -422,6 +501,8 @@ function addSequentialNode(
     out_shape: outShape,
     forward_mean: forwardMean,
     params,
+    input_sample: inputSample,
+    output_sample: outputSample,
   };
 
   nodes.push({
@@ -732,21 +813,57 @@ function runMLP(config: BackpropConfig): BackpropResult {
 // --- CNN: conceptual conv blocks ---
 
 function runCNN(config: BackpropConfig): BackpropResult {
-  const { layers, hiddenDim, inputDim, activation, initMode, initValue } = config;
+  const { layers, hiddenDim, inputDim, activation, initMode, initValue, paramOverrides } = config;
   const nodes: FrontendNode[] = [];
   const edges: FrontendEdge[] = [];
 
-  const size = Math.max(4, Math.min(16, inputDim));
+  // Limit CNN spatial size to at most 8x8 for visualization
+  const size = Math.max(4, Math.min(8, inputDim || 4));
   let C = 1;
   let H = size;
   let W = size;
   let index = 0;
 
-  addSequentialNode(nodes, edges, index++, 'Input', [C, H, W], [C, H, W], {}, 0);
+  // Build a simple input sample from the global inputVector / inputValue
+  const totalHW = H * W;
+  const baseInput = typeof config.inputValue === 'number' ? config.inputValue : 0.5;
+  let imgSample: number[];
+  if (config.inputVector && config.inputVector.length) {
+    const raw = config.inputVector;
+    if (raw.length >= totalHW) {
+      imgSample = raw.slice(0, totalHW);
+    } else {
+      const pad = Array.from({ length: totalHW - raw.length }, () => baseInput);
+      imgSample = [...raw, ...pad];
+    }
+  } else {
+    imgSample = Array.from({ length: totalHW }, () => baseInput);
+  }
+
+  // Treat the flattened image as the output of the Input layer
+  addSequentialNode(nodes, edges, index++, 'Input', [C, H, W], [C, H, W], {}, 0, undefined, imgSample);
+
+  let lastFeatureSample: number[] | undefined;
 
   for (let i = 0; i < layers; i++) {
     const C_out = Math.max(2, Math.min(hiddenDim, C * 2));
-    const convStats = computeTinyConvStats(initMode, initValue);
+    const convNodeId = `layer-${index}`;
+    const keyW = `${convNodeId}:W`;
+    const keyB = `${convNodeId}:b`;
+    const overrides = paramOverrides ?? {};
+    const overrideWArr = overrides[keyW];
+    const overrideBArr = overrides[keyB];
+
+    const agg = (arr: number[] | undefined): number | undefined => {
+      if (!arr || !arr.length) return undefined;
+      const sum = arr.reduce((a, b) => a + b, 0);
+      return sum / arr.length;
+    };
+
+    const overrideW = agg(overrideWArr);
+    const overrideB = agg(overrideBArr);
+
+    const convStats = computeTinyConvStats(initMode, initValue, overrideW, overrideB);
     const convParams: Record<string, ParamInfo> = {
       W: {
         shape: [C_out, C, 3, 3],
@@ -770,42 +887,133 @@ function runCNN(config: BackpropConfig): BackpropResult {
       [C_out, H, W],
       convParams,
       convStats.forwardMean,
+      convStats.xSample,
+      convStats.ySample,
     );
 
     const actLabel = `${activation} ${i + 1}`;
-    addSequentialNode(nodes, edges, index++, actLabel, [C_out, H, W], [C_out, H, W], {}, Math.random() * 0.5);
+
+    // Derive tiny activation samples from conv outputs
+    const actIn = convStats.ySample;
+    let actOut: number[];
+    if (activation === 'ReLU') {
+      actOut = actIn.map((v) => (v < 0 ? 0 : v));
+    } else if (activation === 'Tanh') {
+      actOut = actIn.map((v) => Math.tanh(v));
+    } else {
+      actOut = actIn.map((v) => 1 / (1 + Math.exp(-v)));
+    }
+
+    addSequentialNode(
+      nodes,
+      edges,
+      index++,
+      actLabel,
+      [C_out, H, W],
+      [C_out, H, W],
+      {},
+      convStats.forwardMean,
+      actIn,
+      actOut,
+    );
+
+    lastFeatureSample = actOut;
     C = C_out;
   }
 
   // Global average pool + flatten + output
-  addSequentialNode(nodes, edges, index++, 'GlobalAvgPool', [C, H, W], [C, 1, 1], {}, Math.random() * 0.5);
-  addSequentialNode(nodes, edges, index++, 'Flatten', [C, 1, 1], [C], {}, Math.random() * 0.5);
+  const featureIn = lastFeatureSample && lastFeatureSample.length ? lastFeatureSample : imgSample;
+  const gapVal = featureIn.length
+    ? featureIn.reduce((a, b) => a + b, 0) / featureIn.length
+    : 0;
+  const gapOut = [gapVal];
+
+  addSequentialNode(
+    nodes,
+    edges,
+    index++,
+    'GlobalAvgPool',
+    [C, H, W],
+    [C, 1, 1],
+    {},
+    gapVal,
+    featureIn,
+    gapOut,
+  );
+
+  addSequentialNode(
+    nodes,
+    edges,
+    index++,
+    'Flatten',
+    [C, 1, 1],
+    [C],
+    {},
+    gapVal,
+    gapOut,
+    gapOut,
+  );
 
   const outParams: Record<string, ParamInfo> = {
     W: makeParam([C, 1]),
     b: makeParam([1]),
   };
-  addSequentialNode(nodes, edges, index++, 'Output', [C], [1], outParams, Math.random());
-  addSequentialNode(nodes, edges, index++, 'Loss', [1], [1], {}, Math.random());
 
-  return { nodes, edges, loss: Math.random() };
+  // For the final output, reuse the pooled feature as a tiny scalar example
+  addSequentialNode(nodes, edges, index++, 'Output', [C], [1], outParams, gapVal, gapOut, gapOut);
+
+  const lossVal = gapVal * gapVal;
+  addSequentialNode(nodes, edges, index++, 'Loss', [1], [1], {}, lossVal, gapOut, [lossVal]);
+
+  return { nodes, edges, loss: lossVal };
 }
 
 // --- RNN: conceptual sequence model ---
 
 function runRNN(config: BackpropConfig): BackpropResult {
-  const { layers, hiddenDim, inputDim, initMode, initValue } = config;
+  const { layers, hiddenDim, inputDim, initMode, initValue, paramOverrides } = config;
   const nodes: FrontendNode[] = [];
   const edges: FrontendEdge[] = [];
 
   const T = Math.max(2, Math.min(8, layers * 2));
   let index = 0;
+  const baseStats = computeTinyRNNStats(initMode, initValue);
 
-  addSequentialNode(nodes, edges, index++, 'Input Seq', [T, inputDim], [T, inputDim], {}, 0);
+  addSequentialNode(
+    nodes,
+    edges,
+    index++,
+    'Input Seq',
+    [T, inputDim],
+    [T, inputDim],
+    {},
+    baseStats.forwardMean,
+    undefined,
+    baseStats.xSample,
+  );
 
   let inDim = inputDim;
+  let lastStats = baseStats;
   for (let i = 0; i < layers; i++) {
-    const stats = computeTinyRNNStats(initMode, initValue);
+    const rnnNodeId = `layer-${index}`;
+    const overrides = paramOverrides ?? {};
+    const keyWx = `${rnnNodeId}:W_x`;
+    const keyWh = `${rnnNodeId}:W_h`;
+    const keyB = `${rnnNodeId}:b`;
+
+    const agg = (arr: number[] | undefined): number | undefined => {
+      if (!arr || !arr.length) return undefined;
+      const sum = arr.reduce((a, b) => a + b, 0);
+      return sum / arr.length;
+    };
+
+    const overrideWx = agg(overrides[keyWx]);
+    const overrideWh = agg(overrides[keyWh]);
+    const overrideB = agg(overrides[keyB]);
+
+    const stats = computeTinyRNNStats(initMode, initValue, overrideWx, overrideWh, overrideB);
+    lastStats = stats;
+
     const params: Record<string, ParamInfo> = {
       W_x: {
         shape: [inDim, hiddenDim],
@@ -826,20 +1034,55 @@ function runRNN(config: BackpropConfig): BackpropResult {
         value_sample: [stats.bSample],
       },
     };
-    addSequentialNode(nodes, edges, index++, `RNN ${i + 1}`, [T, inDim], [T, hiddenDim], params, stats.forwardMean);
+    addSequentialNode(
+      nodes,
+      edges,
+      index++,
+      `RNN ${i + 1}`,
+      [T, inDim],
+      [T, hiddenDim],
+      params,
+      stats.forwardMean,
+      stats.xSample,
+      stats.hSample,
+    );
     inDim = hiddenDim;
   }
 
-  addSequentialNode(nodes, edges, index++, 'Final h_T', [T, hiddenDim], [hiddenDim], {}, Math.random() * 0.5);
-  addSequentialNode(nodes, edges, index++, 'Loss', [hiddenDim], [1], {}, Math.random());
+  const finalH = lastStats.hSample.length ? lastStats.hSample[lastStats.hSample.length - 1] : 0;
+  addSequentialNode(
+    nodes,
+    edges,
+    index++,
+    'Final h_T',
+    [T, hiddenDim],
+    [hiddenDim],
+    {},
+    finalH,
+    lastStats.hSample,
+    [finalH],
+  );
 
-  return { nodes, edges, loss: Math.random() };
+  addSequentialNode(
+    nodes,
+    edges,
+    index++,
+    'Loss',
+    [hiddenDim],
+    [1],
+    {},
+    lastStats.lossSample,
+    [finalH],
+    [lastStats.lossSample],
+  );
+
+  return { nodes, edges, loss: lastStats.lossSample };
 }
 
 // --- Transformer: conceptual encoder stack ---
 
 function runTransformer(config: BackpropConfig): BackpropResult {
-  const { layers, hiddenDim, inputDim, initMode, initValue } = config;
+  const { layers, hiddenDim, inputDim, initMode, initValue, paramOverrides } = config;
   const nodes: FrontendNode[] = [];
   const edges: FrontendEdge[] = [];
 
@@ -848,13 +1091,64 @@ function runTransformer(config: BackpropConfig): BackpropResult {
   const heads = config.heads ?? 4;
   let index = 0;
 
-  addSequentialNode(nodes, edges, index++, 'Token Embeddings', [T, dModel], [T, dModel], {}, 0);
-  addSequentialNode(nodes, edges, index++, 'Positional Enc', [T, dModel], [T, dModel], {}, 0);
+  const baseInput = typeof config.inputValue === 'number' ? config.inputValue : 0.5;
+  const tokenSample = [baseInput];
+  const posSample = [baseInput];
+
+  addSequentialNode(
+    nodes,
+    edges,
+    index++,
+    'Token Embeddings',
+    [T, dModel],
+    [T, dModel],
+    {},
+    baseInput,
+    undefined,
+    tokenSample,
+  );
+  addSequentialNode(
+    nodes,
+    edges,
+    index++,
+    'Positional Enc',
+    [T, dModel],
+    [T, dModel],
+    {},
+    baseInput,
+    tokenSample,
+    posSample,
+  );
 
   for (let i = 0; i < layers; i++) {
     const blockInputIndex = index - 1;
+    const overrides = paramOverrides ?? {};
 
-    const attnStats = computeTinySelfAttnStats(initMode, initValue);
+    const selfNodeId = `layer-${index}`;
+    const keyWq = `${selfNodeId}:W_q`;
+    const keyWk = `${selfNodeId}:W_k`;
+    const keyWv = `${selfNodeId}:W_v`;
+    const keyWo = `${selfNodeId}:W_o`;
+
+    const agg = (arr: number[] | undefined): number | undefined => {
+      if (!arr || !arr.length) return undefined;
+      const sum = arr.reduce((a, b) => a + b, 0);
+      return sum / arr.length;
+    };
+
+    const overrideWq = agg(overrides[keyWq]);
+    const overrideWk = agg(overrides[keyWk]);
+    const overrideWv = agg(overrides[keyWv]);
+    const overrideWo = agg(overrides[keyWo]);
+
+    const attnStats = computeTinySelfAttnStats(
+      initMode,
+      initValue,
+      overrideWq,
+      overrideWk,
+      overrideWv,
+      overrideWo,
+    );
     const attnParams: Record<string, ParamInfo> = {
       W_q: {
         shape: [dModel, dModel],
@@ -882,7 +1176,18 @@ function runTransformer(config: BackpropConfig): BackpropResult {
       },
     };
     const selfIdx = index;
-    addSequentialNode(nodes, edges, selfIdx, `Self-Attn ${i + 1}`, [T, dModel], [T, dModel], attnParams, attnStats.forwardMean);
+    addSequentialNode(
+      nodes,
+      edges,
+      selfIdx,
+      `Self-Attn ${i + 1}`,
+      [T, dModel],
+      [T, dModel],
+      attnParams,
+      attnStats.forwardMean,
+      attnStats.inputSample,
+      attnStats.outputSample,
+    );
     index++;
 
     const selfAttnNode = nodes[nodes.length - 1];
@@ -893,7 +1198,18 @@ function runTransformer(config: BackpropConfig): BackpropResult {
       selfAttnNode.data.details.attention_heads = heads;
     }
 
-    const ffnStats = computeTinyFFNStats(initMode, initValue);
+    const ffnNodeId = `layer-${index}`;
+    const keyW1 = `${ffnNodeId}:W1`;
+    const keyB1 = `${ffnNodeId}:b1`;
+    const keyW2 = `${ffnNodeId}:W2`;
+    const keyB2 = `${ffnNodeId}:b2`;
+
+    const overrideW1 = agg(overrides[keyW1]);
+    const overrideB1 = agg(overrides[keyB1]);
+    const overrideW2 = agg(overrides[keyW2]);
+    const overrideB2 = agg(overrides[keyB2]);
+
+    const ffnStats = computeTinyFFNStats(initMode, initValue, overrideW1, overrideB1, overrideW2, overrideB2);
     const ffnParams: Record<string, ParamInfo> = {
       W1: {
         shape: [dModel, 4 * dModel],
@@ -921,7 +1237,19 @@ function runTransformer(config: BackpropConfig): BackpropResult {
       },
     };
     const ffnIdx = index;
-    addSequentialNode(nodes, edges, ffnIdx, `FFN ${i + 1}`, [T, dModel], [T, dModel], ffnParams, ffnStats.forwardMean);
+    addSequentialNode(
+      nodes,
+      edges,
+      ffnIdx,
+      `FFN ${i + 1}`,
+      [T, dModel],
+      [T, dModel],
+      ffnParams,
+      ffnStats.forwardMean,
+      ffnStats.inputSample,
+      ffnStats.outputSample,
+    );
+    var lastBlockOutput: number[] | undefined = ffnStats.outputSample;
     index++;
 
     const blockInputId = `layer-${blockInputIndex}`;
@@ -935,10 +1263,26 @@ function runTransformer(config: BackpropConfig): BackpropResult {
     } as FrontendEdge);
   }
 
-  addSequentialNode(nodes, edges, index++, 'Encoder Output', [T, dModel], [T, dModel], {}, Math.random() * 0.5);
-  addSequentialNode(nodes, edges, index++, 'Loss', [T, dModel], [1], {}, Math.random());
+  const encoderSample = lastBlockOutput && lastBlockOutput.length ? lastBlockOutput : posSample;
+  const encoderMean = encoderSample.reduce((a, b) => a + b, 0) / encoderSample.length;
 
-  return { nodes, edges, loss: Math.random() };
+  addSequentialNode(
+    nodes,
+    edges,
+    index++,
+    'Encoder Output',
+    [T, dModel],
+    [T, dModel],
+    {},
+    encoderMean,
+    encoderSample,
+    encoderSample,
+  );
+
+  const lossVal = encoderMean * encoderMean;
+  addSequentialNode(nodes, edges, index++, 'Loss', [T, dModel], [1], {}, lossVal, encoderSample, [lossVal]);
+
+  return { nodes, edges, loss: lossVal };
 }
 
 export function runBackpropSimulation(config: BackpropConfig): BackpropResult {
