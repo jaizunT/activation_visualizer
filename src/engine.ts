@@ -14,6 +14,9 @@ export interface BackpropConfig {
   heads?: number;
   initMode?: InitMode;
   initValue?: number;
+  inputValue?: number;
+  paramOverrides?: Record<string, number[]>;
+  inputVector?: number[];
 }
 
 export interface ParamInfo {
@@ -31,6 +34,8 @@ export interface LayerDetails {
   attention_pattern?: number[][];
   attention_pattern_heads?: number[][][];
   attention_heads?: number;
+  input_sample?: number[];
+  output_sample?: number[];
 }
 
 export type FrontendNode = Node<{
@@ -438,89 +443,274 @@ function addSequentialNode(
   }
 }
 
-// --- MLP architecture using real backprop ---
+// --- MLP architecture using real backprop with vector/matrix params ---
 
+type MlpLayerKind = 'input' | 'linear' | 'activation' | 'output' | 'loss';
+
+type MlpLayerMeta = {
+  label: string;
+  kind: MlpLayerKind;
+  vec: Value[];
+  inVec?: Value[];
+  inShape: number[];
+  outShape: number[];
+  W?: Value[];
+  b?: Value[];
+  wShape?: number[];
+  bShape?: number[];
+};
+
+function makeInitArray(
+  length: number,
+  override: number[] | undefined,
+  mode: InitMode,
+  base: number,
+  kind: 'weight' | 'bias',
+): number[] {
+  if (override && override.length > 0) {
+    if (override.length === length) {
+      return [...override];
+    }
+    const vals: number[] = [];
+    for (let i = 0; i < length; i++) {
+      vals.push(override[i % override.length]);
+    }
+    return vals;
+  }
+
+  if (mode === 'constant') {
+    return Array.from({ length }, () => base);
+  }
+  // Random mode: Normal(0, 1) for both weights and biases
+  const randNormal = () => {
+    let u = 0;
+    let v = 0;
+    while (u === 0) u = Math.random();
+    while (v === 0) v = Math.random();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  };
+
+  return Array.from({ length }, () => randNormal());
+}
+
+function makeLinearLayerFromVector(
+  inVec: Value[],
+  inDim: number,
+  outDim: number,
+  nodeId: string,
+  paramOverrides: Record<string, number[]> | undefined,
+  initMode: InitMode | undefined,
+  initValue: number | undefined,
+): { W: Value[]; b: Value[]; outVec: Value[] } {
+  const mode = initMode ?? 'random';
+  const base = initValue ?? 0;
+
+  const keyW = `${nodeId}:W`;
+  const keyB = `${nodeId}:b`;
+  const overrideW = paramOverrides ? paramOverrides[keyW] : undefined;
+  const overrideB = paramOverrides ? paramOverrides[keyB] : undefined;
+
+  const totalW = inDim * outDim;
+  const totalB = outDim;
+
+  const wInit = makeInitArray(totalW, overrideW, mode, base, 'weight');
+  const bInit = makeInitArray(totalB, overrideB, mode, base, 'bias');
+
+  const W: Value[] = wInit.map((w) => new Value(w, [], 'Weight', 'W'));
+  const b: Value[] = bInit.map((bv) => new Value(bv, [], 'Bias', 'b'));
+
+  const outVec: Value[] = [];
+  for (let j = 0; j < outDim; j++) {
+    let sum = new Value(0.0);
+    for (let i = 0; i < inDim; i++) {
+      const wVal = W[i * outDim + j];
+      const term = inVec[i].mul(wVal);
+      sum = sum.add(term);
+    }
+    const z = sum.add(b[j]);
+    outVec.push(z);
+  }
+
+  return { W, b, outVec };
+}
+
+// MLP with explicit vector/matrix weights and full backprop
 function runMLP(config: BackpropConfig): BackpropResult {
   const { layers, hiddenDim, activation, inputDim } = config;
 
-  let current = new Value(0.5, [], 'Input', 'Input');
-  current.shape = [1, inputDim];
+  const inDim0 = Math.max(1, inputDim || 1);
 
-  const layerNodes: Value[] = [current];
-
-  const initCfg = { mode: config.initMode ?? 'random', value: config.initValue ?? 0 };
-
-  for (let i = 0; i < layers; i++) {
-    const linear = current.linear(current.shape[1], hiddenDim, initCfg);
-    linear.label = `Linear ${i + 1}`;
-    linear.shape = [1, hiddenDim];
-    layerNodes.push(linear);
-
-    let act: Value;
-    if (activation === 'ReLU') {
-      act = linear.relu();
-      act.op = 'ReLU';
-    } else if (activation === 'Tanh') {
-      act = linear.tanh();
-      act.op = 'Tanh';
+  const baseInput = typeof config.inputValue === 'number' ? config.inputValue : 0.5;
+  let xData: number[];
+  if (config.inputVector && config.inputVector.length) {
+    const raw = config.inputVector;
+    if (raw.length >= inDim0) {
+      xData = raw.slice(0, inDim0);
     } else {
-      act = linear.sigmoid();
-      act.op = 'Sigmoid';
+      const pad = Array.from({ length: inDim0 - raw.length }, () => baseInput);
+      xData = [...raw, ...pad];
     }
-    act.label = `${activation} ${i + 1}`;
-    act.shape = linear.shape;
-    layerNodes.push(act);
-    current = act;
+  } else {
+    xData = Array.from({ length: inDim0 }, () => baseInput);
   }
 
-  const output = current.linear(hiddenDim, 1, initCfg);
-  output.label = 'Output';
-  output.shape = [1, 1];
-  layerNodes.push(output);
+  const xVec: Value[] = xData.map((v, i) => new Value(v, [], 'Input', `x_${i}`));
 
+  const layersMeta: MlpLayerMeta[] = [];
+
+  // Input layer
+  layersMeta.push({
+    label: 'Input',
+    kind: 'input',
+    vec: xVec,
+    inShape: [1, inDim0],
+    outShape: [1, inDim0],
+  });
+
+  let currentVec = xVec;
+  let currentDim = inDim0;
+
+  for (let i = 0; i < layers; i++) {
+    const linearNodeId = `layer-${layersMeta.length}`;
+    const { W, b, outVec } = makeLinearLayerFromVector(
+      currentVec,
+      currentDim,
+      hiddenDim,
+      linearNodeId,
+      config.paramOverrides,
+      config.initMode,
+      config.initValue,
+    );
+
+    layersMeta.push({
+      label: `Linear ${i + 1}`,
+      kind: 'linear',
+      vec: outVec,
+      inVec: currentVec,
+      inShape: [1, currentDim],
+      outShape: [1, hiddenDim],
+      W,
+      b,
+      wShape: [currentDim, hiddenDim],
+      bShape: [hiddenDim],
+    });
+
+    let actVec: Value[];
+    if (activation === 'ReLU') {
+      actVec = outVec.map((v) => v.relu());
+    } else if (activation === 'Tanh') {
+      actVec = outVec.map((v) => v.tanh());
+    } else {
+      actVec = outVec.map((v) => v.sigmoid());
+    }
+
+    layersMeta.push({
+      label: `${activation} ${i + 1}`,
+      kind: 'activation',
+      vec: actVec,
+      inVec: outVec,
+      inShape: [1, hiddenDim],
+      outShape: [1, hiddenDim],
+    });
+
+    currentVec = actVec;
+    currentDim = hiddenDim;
+  }
+
+  // Output layer (maps to scalar)
+  const outputNodeId = `layer-${layersMeta.length}`;
+  const { W: Wout, b: Bout, outVec: yVec } = makeLinearLayerFromVector(
+    currentVec,
+    currentDim,
+    1,
+    outputNodeId,
+    config.paramOverrides,
+    config.initMode,
+    config.initValue,
+  );
+
+  layersMeta.push({
+    label: 'Output',
+    kind: 'output',
+    vec: yVec,
+    inVec: currentVec,
+    inShape: [1, currentDim],
+    outShape: [1, 1],
+    W: Wout,
+    b: Bout,
+    wShape: [currentDim, 1],
+    bShape: [1],
+  });
+
+  const y = yVec[0];
   const target = new Value(1.0);
-  const diff = output.add(target.mul(-1.0));
+  const diff = y.add(target.mul(-1.0));
   const loss = diff.mul(diff);
   loss.op = 'MSELoss';
   loss.label = 'Loss';
-  loss.shape = [1, 1];
-  layerNodes.push(loss);
+
+  layersMeta.push({
+    label: 'Loss',
+    kind: 'loss',
+    vec: [loss],
+    inVec: [y],
+    inShape: [1, 1],
+    outShape: [1, 1],
+  });
 
   loss.backward();
 
   const nodes: FrontendNode[] = [];
   const edges: FrontendEdge[] = [];
 
-  layerNodes.forEach((v, index) => {
-    const firstPrev = Array.from(v.prev)[0];
-    const inShape = firstPrev ? firstPrev.shape : v.shape;
-
-    const params: Record<string, ParamInfo> = {};
-    Object.entries(v.params || {}).forEach(([name, info]) => {
-      const val = info.val;
-      const gradAbs = Math.abs(val.grad);
-      params[name] = {
-        shape: info.shape,
-        grad_mean: gradAbs,
-        grad_std: 0,
-        value_sample: [val.data],
-      };
-    });
-
-    const label = v.label || v.op || 'Layer';
+  layersMeta.forEach((layer, index) => {
     const nodeId = `layer-${index}`;
 
+    const forwardMean =
+      layer.vec.length > 0
+        ? layer.vec.reduce((s, v) => s + v.data, 0) / layer.vec.length
+        : 0;
+
+    const params: Record<string, ParamInfo> = {};
+
+    if (layer.W && layer.b && layer.wShape && layer.bShape) {
+      const flatten = (arr: Value[]) => arr.map((v) => v.data);
+      const gradMean = (arr: Value[]) =>
+        arr.length > 0
+          ? arr.reduce((s, v) => s + Math.abs(v.grad), 0) / arr.length
+          : 0;
+
+      params.W = {
+        shape: layer.wShape,
+        grad_mean: gradMean(layer.W),
+        grad_std: 0,
+        value_sample: flatten(layer.W),
+      };
+
+      params.b = {
+        shape: layer.bShape,
+        grad_mean: gradMean(layer.b),
+        grad_std: 0,
+        value_sample: flatten(layer.b),
+      };
+    }
+
+    const inputSample = layer.inVec && layer.inVec.length > 0 ? layer.inVec.map((v) => v.data) : undefined;
+    const outputSample = layer.vec && layer.vec.length > 0 ? layer.vec.map((v) => v.data) : undefined;
+
     const details: LayerDetails = {
-      in_shape: inShape || '-',
-      out_shape: v.shape,
-      forward_mean: v.data,
+      in_shape: layer.inShape,
+      out_shape: layer.outShape,
+      forward_mean: forwardMean,
       params,
+      input_sample: inputSample,
+      output_sample: outputSample,
     };
 
     nodes.push({
       id: nodeId,
       type: 'customLayer',
-      data: { label, details },
+      data: { label: layer.label, details },
       position: { x: 0, y: 0 },
     } as FrontendNode);
 
