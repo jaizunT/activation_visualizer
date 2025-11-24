@@ -867,9 +867,10 @@ function runCNN(config: BackpropConfig): BackpropResult {
 
     const overrideBScalar = agg(overrideBArr);
 
-    // Kernel size K is controlled by hiddenDim ("Kernel (K):" in the UI).
+    // Kernel size K is controlled by hiddenDim ("Kernel (K):" in the UI),
+    // but is clamped to at most 8 so the conv stays small and visualizable.
     const Kraw = hiddenDim || 3;
-    const Kmax = Math.max(1, Math.min(H, W));
+    const Kmax = Math.min(8, Math.max(1, Math.min(H, W)));
     const K = Math.max(1, Math.min(Kraw, Kmax));
 
     const kernelLen = K * K;

@@ -10,6 +10,7 @@ import 'reactflow/dist/style.css';
 import { Play, Activity } from 'lucide-react';
 
 import BackpropNode from './components/BackpropNode';
+import AiAssistantPanel from './components/AiAssistantPanel';
 import Latex from 'react-latex-next';
 import 'katex/dist/katex.min.css';
 import { getLayoutedElements } from './utils/layout';
@@ -37,6 +38,13 @@ type BlockTemplate = {
 };
 
 type VectorViewMode = 'numbers' | 'blocks';
+
+export type AiProvider = 'openai' | 'anthropic' | 'google';
+
+export type AiMessage = {
+  role: 'user' | 'assistant';
+  content: string;
+};
 
 function valueToColor(v: number): string {
   const clamp = (x: number) => Math.max(-1, Math.min(1, x));
@@ -187,6 +195,12 @@ export default function App() {
   const [rnnStep, setRnnStep] = useState(0);
   const [rnnH0, setRnnH0] = useState<number[]>([]);
   const [activeH0Index, setActiveH0Index] = useState<number | null>(null);
+  const [isAiOpen, setIsAiOpen] = useState(false);
+  const [aiProvider, setAiProvider] = useState<AiProvider | ''>('');
+  const [aiApiKey, setAiApiKey] = useState('');
+  const [aiModel, setAiModel] = useState('');
+  const [aiMessages, setAiMessages] = useState<AiMessage[]>([]);
+  const [aiLoading, setAiLoading] = useState(false);
 
   const activeInputIndex = pinnedInputIndex ?? hoveredInputIndex;
   const activeParamIndex = pinnedParamIndex ?? hoveredParamIndex;
@@ -350,6 +364,26 @@ export default function App() {
     seqLen,
     rnnH0,
   ]);
+
+  // When switching to CNN, set sensible defaults for kernel size and input dim.
+  useEffect(() => {
+    if (architecture !== 'cnn') return;
+
+    const defaultKernel = 3;
+    const defaultDim = 8;
+
+    setHiddenDim(defaultKernel);
+    setInputDim(defaultDim);
+
+    const dimForVector = defaultDim * defaultDim;
+    setInputVector((prev) => {
+      const next = Array.from({ length: dimForVector }, (_, i) => prev[i] ?? 0.5);
+      const mean =
+        next.length > 0 ? next.reduce((a, b) => a + b, 0) / next.length : 0;
+      setInputValue(mean);
+      return next;
+    });
+  }, [architecture]);
 
   useEffect(() => {
     if (architecture !== 'rnn') return;
@@ -938,6 +972,155 @@ export default function App() {
     [editingParam, editingParamValues, setNodes],
   );
 
+  const handleAiAsk = useCallback(
+    async (question: string) => {
+      const q = question.trim();
+      if (!q || !aiProvider || !aiApiKey) return;
+
+      setAiMessages((prev) => [...prev, { role: 'user', content: q }]);
+      setAiLoading(true);
+      try {
+        const contextParts: string[] = [];
+        contextParts.push('You answer questions about the math and theory of neural networks.');
+        contextParts.push(`Current architecture: ${architecture}.`);
+        if (activeLayerLabel) {
+          contextParts.push(`Current layer or block: ${activeLayerLabel}.`);
+        }
+        const describeShape = (shape: number[] | string | undefined): string => {
+          if (!shape) return '?';
+          if (typeof shape === 'string') return shape;
+          if (!Array.isArray(shape)) return '?';
+          return `[${shape.join(', ')}]`;
+        };
+
+        const layersSummary = nodes
+          .map((node, idx) => {
+            const data = node.data as {
+              label?: string;
+              details?: LayerDetails;
+            } | undefined;
+            if (!data) return null;
+            const label = data.label ?? `Layer ${idx + 1}`;
+            const details = data.details;
+            if (!details) {
+              return `${idx + 1}. ${label}`;
+            }
+            const inS = describeShape(details.in_shape as any);
+            const outS = describeShape(details.out_shape as any);
+            return `${idx + 1}. ${label}: ${inS} -> ${outS}`;
+          })
+          .filter((x): x is string => Boolean(x))
+          .join(' ');
+
+        if (layersSummary) {
+          contextParts.push('Current architecture sequence with shapes (in -> out):');
+          contextParts.push(layersSummary);
+        }
+        const systemPrompt = contextParts.join(' ');
+
+        let answer = '';
+
+        if (aiProvider === 'openai') {
+          const body = {
+            model: aiModel || 'gpt-4.1-mini',
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: q },
+            ],
+          };
+          const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${aiApiKey}`,
+            },
+            body: JSON.stringify(body),
+          });
+          const data = await resp.json();
+          answer =
+            data.choices?.[0]?.message?.content?.trim() ??
+            'The model did not return any content.';
+        } else if (aiProvider === 'anthropic') {
+          const body = {
+            model: aiModel || 'claude-3-5-sonnet-20241022',
+            max_tokens: 512,
+            system: systemPrompt,
+            messages: [
+              {
+                role: 'user',
+                content: q,
+              },
+            ],
+          };
+          const resp = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-api-key': aiApiKey,
+              'anthropic-version': '2023-06-01',
+            },
+            body: JSON.stringify(body),
+          });
+          const data = await resp.json();
+          if (Array.isArray(data.content)) {
+            answer = data.content
+              .map((part: any) => part.text || '')
+              .join(' ')
+              .trim();
+          }
+          if (!answer) {
+            answer = 'The model did not return any content.';
+          }
+        } else if (aiProvider === 'google') {
+          const modelId = aiModel || 'gemini-1.5-flash';
+          const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${encodeURIComponent(
+            aiApiKey,
+          )}`;
+          const body = {
+            contents: [
+              {
+                parts: [
+                  { text: systemPrompt },
+                  { text: `User question: ${q}` },
+                ],
+              },
+            ],
+          };
+          const resp = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          const data = await resp.json();
+          if (Array.isArray(data.candidates) && data.candidates.length > 0) {
+            const parts = data.candidates[0].content?.parts;
+            if (Array.isArray(parts)) {
+              answer = parts
+                .map((p: any) => p.text || '')
+                .join(' ')
+                .trim();
+            }
+          }
+          if (!answer) {
+            answer = 'The model did not return any content.';
+          }
+        }
+
+        setAiMessages((prev) => [...prev, { role: 'assistant', content: answer }]);
+      } catch (error: any) {
+        const message =
+          error?.message || 'Error calling the model. Check your API key and model.';
+        setAiMessages((prev) => [
+          ...prev,
+          { role: 'assistant', content: message },
+        ]);
+      } finally {
+        setAiLoading(false);
+      }
+    },
+    [aiProvider, aiApiKey, aiModel, architecture, activeLayerLabel, nodes],
+  );
+
   const handleParamElementChange = useCallback(
     (index: number, value: number) => {
       if (!editingParam || !editingParamValues) return;
@@ -1145,6 +1328,13 @@ export default function App() {
             className="bg-slate-800 hover:bg-slate-700 text-white px-3 py-1.5 rounded-md text-xs font-medium border border-slate-600"
           >
             {isBlockPanelOpen ? 'Close Blocks' : 'Blocks'}
+          </button>
+          <button
+            type="button"
+            onClick={() => setIsAiOpen((open) => !open)}
+            className="bg-slate-800 hover:bg-slate-700 text-white px-3 py-1.5 rounded-md text-xs font-medium border border-slate-600"
+          >
+            {isAiOpen ? 'Hide AI' : 'AI Assistant'}
           </button>
         </div>
 
@@ -1600,9 +1790,27 @@ export default function App() {
         </div>
       )}
 
+      <AiAssistantPanel
+        isOpen={isAiOpen}
+        onToggle={() => setIsAiOpen((open) => !open)}
+        provider={aiProvider}
+        onProviderChange={setAiProvider}
+        apiKey={aiApiKey}
+        onApiKeyChange={setAiApiKey}
+        model={aiModel}
+        onModelChange={setAiModel}
+        messages={aiMessages}
+        onAsk={handleAiAsk}
+        loading={aiLoading}
+      />
+
       {(activeLayerLabel || pinnedNodeId || activeParam || (activeNodeParams && activeNodeParams.length > 0)) &&
         (activeChainRules.length > 0 || overlayBackSignal || overlayActivations) && (
-        <div className="pointer-events-none absolute top-40 left-4 z-30">
+        <div
+          className={`pointer-events-none absolute top-40 z-30 ${
+            isBlockPanelOpen ? 'left-72' : 'left-4'
+          }`}
+        >
           <div className="pointer-events-auto max-w-[60vw] max-h-[60vh] rounded-lg border border-slate-700 bg-slate-900/95 px-4 py-2 text-xs shadow-xl flex flex-col gap-1 justify-start overflow-y-auto">
             <span className="uppercase tracking-wider text-slate-500 text-[10px] flex-shrink-0 text-left">
               More info
