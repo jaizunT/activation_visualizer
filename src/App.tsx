@@ -46,6 +46,27 @@ export type AiMessage = {
   content: string;
 };
 
+type AiModelOption = {
+  id: string;
+  label: string;
+};
+
+const DEFAULT_AI_MODELS: Record<AiProvider, AiModelOption[]> = {
+  openai: [
+    { id: 'gpt-4.1-mini', label: 'gpt-4.1-mini' },
+    { id: 'gpt-4.1', label: 'gpt-4.1' },
+    { id: 'o3-mini', label: 'o3-mini' },
+  ],
+  anthropic: [
+    { id: 'claude-3-5-sonnet-20241022', label: 'claude-3.5-sonnet' },
+    { id: 'claude-3-5-haiku-20241022', label: 'claude-3.5-haiku' },
+  ],
+  google: [
+    { id: 'gemini-1.5-flash', label: 'gemini-1.5-flash' },
+    { id: 'gemini-1.5-pro', label: 'gemini-1.5-pro' },
+  ],
+};
+
 function valueToColor(v: number): string {
   const clamp = (x: number) => Math.max(-1, Math.min(1, x));
   const x = clamp(v);
@@ -172,7 +193,7 @@ export default function App() {
     Array.from({ length: 10 }, () => 0.5),
   );
 
-  const [viewMode, setViewMode] = useState<VectorViewMode>('numbers');
+  const [viewMode, setViewMode] = useState<VectorViewMode>('blocks');
   const [isBlockPanelOpen, setIsBlockPanelOpen] = useState(false);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [pinnedNodeId, setPinnedNodeId] = useState<string | null>(null);
@@ -201,6 +222,11 @@ export default function App() {
   const [aiModel, setAiModel] = useState('');
   const [aiMessages, setAiMessages] = useState<AiMessage[]>([]);
   const [aiLoading, setAiLoading] = useState(false);
+  const [aiModels, setAiModels] = useState<Record<AiProvider, AiModelOption[]>>(
+    DEFAULT_AI_MODELS,
+  );
+  const [aiModelsLoading, setAiModelsLoading] = useState(false);
+  const [aiModelsError, setAiModelsError] = useState<string | null>(null);
 
   const activeInputIndex = pinnedInputIndex ?? hoveredInputIndex;
   const activeParamIndex = pinnedParamIndex ?? hoveredParamIndex;
@@ -971,6 +997,92 @@ export default function App() {
     },
     [editingParam, editingParamValues, setNodes],
   );
+
+  const handleRefreshModels = useCallback(async () => {
+    if (!aiProvider || !aiApiKey) return;
+
+    setAiModelsLoading(true);
+    setAiModelsError(null);
+
+    try {
+      let models: AiModelOption[] = [];
+
+      if (aiProvider === 'openai') {
+        const resp = await fetch('https://api.openai.com/v1/models', {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${aiApiKey}`,
+          },
+        });
+        const data = await resp.json();
+        if (Array.isArray(data.data)) {
+          models = data.data
+            .map((m: any) => {
+              const id = typeof m.id === 'string' ? m.id : '';
+              return id ? { id, label: id } : null;
+            })
+            .filter((m: AiModelOption | null): m is AiModelOption => Boolean(m));
+        }
+      } else if (aiProvider === 'anthropic') {
+        const resp = await fetch('https://api.anthropic.com/v1/models', {
+          method: 'GET',
+          headers: {
+            'x-api-key': aiApiKey,
+            'anthropic-version': '2023-06-01',
+          },
+        });
+        const data = await resp.json();
+        if (Array.isArray(data.data)) {
+          models = data.data
+            .map((m: any) => {
+              const id = typeof m.id === 'string' ? m.id : '';
+              return id ? { id, label: id } : null;
+            })
+            .filter((m: AiModelOption | null): m is AiModelOption => Boolean(m));
+        }
+      } else if (aiProvider === 'google') {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(
+          aiApiKey,
+        )}`;
+        const resp = await fetch(url, {
+          method: 'GET',
+          headers: { 'Content-Type': 'application/json' },
+        });
+        const data = await resp.json();
+        if (Array.isArray(data.models)) {
+          models = data.models
+            .map((m: any) => {
+              const name = typeof m.name === 'string' ? m.name : '';
+              const id = name ? name.split('/').pop() ?? '' : '';
+              const label =
+                (typeof m.displayName === 'string' && m.displayName) || id;
+              return id ? { id, label } : null;
+            })
+            .filter((m: AiModelOption | null): m is AiModelOption => Boolean(m));
+        }
+      }
+
+      if (!models.length) {
+        setAiModelsError('No models returned for this key; showing defaults.');
+      }
+
+      setAiModels((prev) => ({
+        ...prev,
+        [aiProvider]: models.length ? models : prev[aiProvider],
+      }));
+
+      const effectiveModels = models.length ? models : aiModels[aiProvider];
+      if (effectiveModels.length && !effectiveModels.some((m) => m.id === aiModel)) {
+        setAiModel(effectiveModels[0].id);
+      }
+    } catch (err: any) {
+      setAiModelsError(
+        err?.message || 'Failed to refresh models. Check your API key/permissions.',
+      );
+    } finally {
+      setAiModelsLoading(false);
+    }
+  }, [aiProvider, aiApiKey, aiModel, aiModels]);
 
   const handleAiAsk = useCallback(
     async (question: string) => {
@@ -1799,6 +1911,10 @@ export default function App() {
         onApiKeyChange={setAiApiKey}
         model={aiModel}
         onModelChange={setAiModel}
+        models={aiProvider ? aiModels[aiProvider] ?? [] : []}
+        modelsLoading={aiModelsLoading}
+        modelsError={aiModelsError}
+        onRefreshModels={handleRefreshModels}
         messages={aiMessages}
         onAsk={handleAiAsk}
         loading={aiLoading}

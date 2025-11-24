@@ -1,5 +1,10 @@
-import { useEffect, useMemo, useState, FormEvent } from 'react';
+import { useEffect, useState, FormEvent } from 'react';
 import type { AiProvider, AiMessage } from '../App';
+
+type ModelOption = {
+  id: string;
+  label: string;
+};
 
 type Props = {
   isOpen: boolean;
@@ -10,6 +15,10 @@ type Props = {
   onApiKeyChange: (v: string) => void;
   model: string;
   onModelChange: (v: string) => void;
+  models: ModelOption[];
+  modelsLoading: boolean;
+  modelsError: string | null;
+  onRefreshModels: () => void;
   messages: AiMessage[];
   onAsk: (question: string) => Promise<void> | void;
   loading: boolean;
@@ -24,47 +33,26 @@ export default function AiAssistantPanel({
   onApiKeyChange,
   model,
   onModelChange,
+  models,
+  modelsLoading,
+  modelsError,
+  onRefreshModels,
   messages,
   onAsk,
   loading,
 }: Props) {
   const [draft, setDraft] = useState('');
 
-  const MODEL_OPTIONS = useMemo(
-    () =>
-      ({
-        openai: [
-          { id: 'gpt-4.1-mini', label: 'gpt-4.1-mini' },
-          { id: 'gpt-4.1', label: 'gpt-4.1' },
-          { id: 'o3-mini', label: 'o3-mini' },
-        ],
-        anthropic: [
-          { id: 'claude-3-5-sonnet-20241022', label: 'claude-3.5-sonnet' },
-          { id: 'claude-3-5-haiku-20241022', label: 'claude-3.5-haiku' },
-        ],
-        google: [
-          { id: 'gemini-1.5-flash', label: 'gemini-1.5-flash' },
-          { id: 'gemini-1.5-pro', label: 'gemini-1.5-pro' },
-        ],
-      } as Record<AiProvider, { id: string; label: string }[]>),
-    [],
-  );
-
   useEffect(() => {
     if (!provider) return;
-    if (!model && MODEL_OPTIONS[provider] && MODEL_OPTIONS[provider].length) {
-      onModelChange(MODEL_OPTIONS[provider][0].id);
+    if (!model && models.length) {
+      onModelChange(models[0].id);
     }
-  }, [provider, model, MODEL_OPTIONS, onModelChange]);
-
-  const currentModelOptions = provider ? MODEL_OPTIONS[provider] : [];
+  }, [provider, model, models, onModelChange]);
 
   const handleProviderChange = (value: string) => {
     const p = value as AiProvider | '';
     onProviderChange(p);
-    if (p && MODEL_OPTIONS[p] && MODEL_OPTIONS[p].length) {
-      onModelChange(MODEL_OPTIONS[p][0].id);
-    }
   };
 
   const handleSubmit = async (e: FormEvent) => {
@@ -108,21 +96,38 @@ export default function AiAssistantPanel({
         </div>
 
         <div className="space-y-1">
-          <label className="block text-slate-300">Model</label>
+          <div className="flex items-center justify-between">
+            <label className="block text-slate-300">Model</label>
+            <button
+              type="button"
+              onClick={() => {
+                if (!provider || !apiKey || modelsLoading) return;
+                onRefreshModels();
+              }}
+              disabled={!provider || !apiKey || modelsLoading}
+              className="text-[10px] text-slate-400 hover:text-slate-100 disabled:opacity-40"
+            >
+              {modelsLoading ? 'Refreshing…' : 'Refresh'}
+            </button>
+          </div>
           <select
             value={model}
             onChange={(e) => onModelChange(e.target.value)}
-            disabled={!provider}
+            disabled={!provider || !models.length}
             className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1 text-[11px] text-slate-100 disabled:opacity-50"
           >
             {!provider && <option value="">Choose provider first</option>}
+            {provider && !models.length && <option value="">No models</option>}
             {provider &&
-              currentModelOptions.map((opt) => (
+              models.map((opt) => (
                 <option key={opt.id} value={opt.id}>
                   {opt.label}
                 </option>
               ))}
           </select>
+          {modelsError && (
+            <p className="text-[9px] text-rose-400">{modelsError}</p>
+          )}
         </div>
 
         <div className="space-y-1">
