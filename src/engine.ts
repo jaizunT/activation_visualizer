@@ -17,6 +17,8 @@ export interface BackpropConfig {
   inputValue?: number;
   paramOverrides?: Record<string, number[]>;
   inputVector?: number[];
+  seqLen?: number;
+  rnnH0?: number[];
 }
 
 export interface ParamInfo {
@@ -844,9 +846,12 @@ function runCNN(config: BackpropConfig): BackpropResult {
   addSequentialNode(nodes, edges, index++, 'Input', [C, H, W], [C, H, W], {}, 0, undefined, imgSample);
 
   let lastFeatureSample: number[] | undefined;
+  // Current feature map, flattened. We store only the top channel explicitly,
+  // but conceptually treat C channels by repeating the top channel.
+  let feature: number[] = imgSample.slice();
 
   for (let i = 0; i < layers; i++) {
-    const C_out = Math.max(2, Math.min(hiddenDim, C * 2));
+    const C_out = Math.max(1, Math.min(4, C * 2));
     const convNodeId = `layer-${index}`;
     const keyW = `${convNodeId}:W`;
     const keyB = `${convNodeId}:b`;
@@ -860,73 +865,150 @@ function runCNN(config: BackpropConfig): BackpropResult {
       return sum / arr.length;
     };
 
-    const overrideW = agg(overrideWArr);
-    const overrideB = agg(overrideBArr);
+    const overrideBScalar = agg(overrideBArr);
 
-    const convStats = computeTinyConvStats(initMode, initValue, overrideW, overrideB);
+    // Kernel size K is controlled by hiddenDim ("Kernel (K):" in the UI).
+    const Kraw = hiddenDim || 3;
+    const Kmax = Math.max(1, Math.min(H, W));
+    const K = Math.max(1, Math.min(Kraw, Kmax));
+
+    const kernelLen = K * K;
+    // Build full KxK kernel weights from overrides or initialization.
+    const wKernel: number[] = (() => {
+      if (overrideWArr && overrideWArr.length) {
+        const vals: number[] = [];
+        for (let idx = 0; idx < kernelLen; idx++) {
+          vals.push(overrideWArr[idx % overrideWArr.length]);
+        }
+        return vals;
+      }
+      const modeW = initMode ?? 'random';
+      const baseW = initValue ?? 0;
+      return makeInitArray(kernelLen, undefined, modeW, baseW, 'weight');
+    })();
+
+    const bScalar =
+      overrideBScalar !== undefined
+        ? overrideBScalar
+        : (() => {
+            const modeB = initMode ?? 'random';
+            const baseB = initValue ?? 0;
+            const arr = makeInitArray(1, undefined, modeB, baseB, 'bias');
+            return arr[0] ?? 0;
+          })();
+
+    // Use tiny conv stats only for param metadata (not for feature values).
+    const overrideWForStats = wKernel.length
+      ? wKernel.reduce((a, b) => a + b, 0) / wKernel.length
+      : undefined;
+    const convStats = computeTinyConvStats(initMode, initValue, overrideWForStats, bScalar);
     const convParams: Record<string, ParamInfo> = {
       W: {
-        shape: [C_out, C, 3, 3],
+        shape: [1, 1, K, K],
         grad_mean: convStats.wGradMean,
         grad_std: 0,
-        value_sample: [convStats.wSample],
+        value_sample: wKernel,
       },
       b: {
-        shape: [C_out],
+        shape: [1],
         grad_mean: convStats.bGradMean,
         grad_std: 0,
-        value_sample: [convStats.bSample],
+        value_sample: [bScalar],
       },
     };
+
+    // Real 2D convolution over the top channel with a KxK kernel, no padding (valid conv)
+    const inTop = feature.slice(0, H * W);
+    const Hout = Math.max(1, H - K + 1);
+    const Wout = Math.max(1, W - K + 1);
+    const convOutTop: number[] = [];
+    for (let r = 0; r < Hout; r++) {
+      for (let cIdx = 0; cIdx < Wout; cIdx++) {
+        let sum = 0;
+        for (let dr = 0; dr < K; dr++) {
+          for (let dc = 0; dc < K; dc++) {
+            const rr = r + dr;
+            const cc = cIdx + dc;
+            const idx = rr * W + cc;
+            const wVal = wKernel[dr * K + dc] ?? 0;
+            sum += inTop[idx] * wVal;
+          }
+        }
+        const val = sum + bScalar;
+        convOutTop.push(val);
+      }
+    }
+
+    const convMean = convOutTop.length ? convOutTop.reduce((a, b) => a + b, 0) / convOutTop.length : 0;
+
     addSequentialNode(
       nodes,
       edges,
       index++,
       `Conv ${i + 1}`,
       [C, H, W],
-      [C_out, H, W],
+      [C_out, Hout, Wout],
       convParams,
-      convStats.forwardMean,
-      convStats.xSample,
-      convStats.ySample,
+      convMean,
+      inTop,
+      convOutTop,
     );
 
     const actLabel = `${activation} ${i + 1}`;
 
-    // Derive tiny activation samples from conv outputs
-    const actIn = convStats.ySample;
-    let actOut: number[];
+    // Apply activation to the real conv outputs
+    const actIn = convOutTop;
+    let actOutTop: number[];
     if (activation === 'ReLU') {
-      actOut = actIn.map((v) => (v < 0 ? 0 : v));
+      actOutTop = actIn.map((v) => (v < 0 ? 0 : v));
     } else if (activation === 'Tanh') {
-      actOut = actIn.map((v) => Math.tanh(v));
+      actOutTop = actIn.map((v) => Math.tanh(v));
     } else {
-      actOut = actIn.map((v) => 1 / (1 + Math.exp(-v)));
+      actOutTop = actIn.map((v) => 1 / (1 + Math.exp(-v)));
     }
+    const actMean = actOutTop.length ? actOutTop.reduce((a, b) => a + b, 0) / actOutTop.length : 0;
 
     addSequentialNode(
       nodes,
       edges,
       index++,
       actLabel,
-      [C_out, H, W],
-      [C_out, H, W],
+      [C_out, Hout, Wout],
+      [C_out, Hout, Wout],
       {},
-      convStats.forwardMean,
+      actMean,
       actIn,
-      actOut,
+      actOutTop,
     );
 
-    lastFeatureSample = actOut;
+    // Propagate to next layer: replicate top-channel activation across C_out channels
+    const nextFeature: number[] = [];
+    for (let cOut = 0; cOut < C_out; cOut++) {
+      nextFeature.push(...actOutTop);
+    }
+
+    lastFeatureSample = actOutTop;
+    feature = nextFeature;
     C = C_out;
+    H = Hout;
+    W = Wout;
   }
 
   // Global average pool + flatten + output
-  const featureIn = lastFeatureSample && lastFeatureSample.length ? lastFeatureSample : imgSample;
-  const gapVal = featureIn.length
-    ? featureIn.reduce((a, b) => a + b, 0) / featureIn.length
-    : 0;
-  const gapOut = [gapVal];
+  // feature currently holds C * H * W values (top-channel activations replicated across channels).
+  const featureAll = feature.length ? feature : imgSample;
+  const elemsPerChannel = H * W;
+  const gapVec: number[] = [];
+  for (let cIdx = 0; cIdx < C; cIdx++) {
+    let sumCh = 0;
+    for (let i = 0; i < elemsPerChannel; i++) {
+      const idx = cIdx * elemsPerChannel + i;
+      sumCh += featureAll[idx] ?? 0;
+    }
+    const meanCh = elemsPerChannel > 0 ? sumCh / elemsPerChannel : 0;
+    gapVec.push(meanCh);
+  }
+  const gapMean = gapVec.length ? gapVec.reduce((a, b) => a + b, 0) / gapVec.length : 0;
 
   addSequentialNode(
     nodes,
@@ -936,9 +1018,9 @@ function runCNN(config: BackpropConfig): BackpropResult {
     [C, H, W],
     [C, 1, 1],
     {},
-    gapVal,
-    featureIn,
-    gapOut,
+    gapMean,
+    featureAll,
+    gapVec,
   );
 
   addSequentialNode(
@@ -949,9 +1031,9 @@ function runCNN(config: BackpropConfig): BackpropResult {
     [C, 1, 1],
     [C],
     {},
-    gapVal,
-    gapOut,
-    gapOut,
+    gapMean,
+    gapVec,
+    gapVec,
   );
 
   const outParams: Record<string, ParamInfo> = {
@@ -959,11 +1041,11 @@ function runCNN(config: BackpropConfig): BackpropResult {
     b: makeParam([1]),
   };
 
-  // For the final output, reuse the pooled feature as a tiny scalar example
-  addSequentialNode(nodes, edges, index++, 'Output', [C], [1], outParams, gapVal, gapOut, gapOut);
+  // Final output: simple linear readout from the flattened C-dimensional vector.
+  addSequentialNode(nodes, edges, index++, 'Output', [C], [1], outParams, gapMean, gapVec, [gapMean]);
 
-  const lossVal = gapVal * gapVal;
-  addSequentialNode(nodes, edges, index++, 'Loss', [1], [1], {}, lossVal, gapOut, [lossVal]);
+  const lossVal = gapMean * gapMean;
+  addSequentialNode(nodes, edges, index++, 'Loss', [1], [1], {}, lossVal, gapVec, [lossVal]);
 
   return { nodes, edges, loss: lossVal };
 }
@@ -971,115 +1053,318 @@ function runCNN(config: BackpropConfig): BackpropResult {
 // --- RNN: conceptual sequence model ---
 
 function runRNN(config: BackpropConfig): BackpropResult {
-  const { layers, hiddenDim, inputDim, initMode, initValue, paramOverrides } = config;
+  const {
+    layers,
+    hiddenDim,
+    inputDim,
+    initMode,
+    initValue,
+    paramOverrides,
+    seqLen,
+    inputVector,
+    inputValue,
+    rnnH0,
+  } = config;
+
+  const Traw = typeof seqLen === 'number' ? seqLen : 4;
+  const T = Math.max(1, Math.min(4, Traw));
+  const d0 = Math.max(1, inputDim || 1);
+  const H = Math.max(1, hiddenDim || 1);
+
+  const baseInput = typeof inputValue === 'number' ? inputValue : 0.5;
+  const totalIn = T * d0;
+
+  let flatInput: number[];
+  if (inputVector && inputVector.length) {
+    if (inputVector.length >= totalIn) {
+      flatInput = inputVector.slice(0, totalIn);
+    } else {
+      const pad = Array.from({ length: totalIn - inputVector.length }, () => baseInput);
+      flatInput = [...inputVector, ...pad];
+    }
+  } else {
+    flatInput = Array.from({ length: totalIn }, () => baseInput);
+  }
+
+  const xSeq0: Value[][] = [];
+  for (let t = 0; t < T; t++) {
+    const row: Value[] = [];
+    for (let i = 0; i < d0; i++) {
+      const idx = t * d0 + i;
+      row.push(new Value(flatInput[idx], [], 'Input', `x_${t}_${i}`));
+    }
+    xSeq0.push(row);
+  }
+
+  type RnnLayerMeta = {
+    label: string;
+    inDim: number;
+    hiddenDim: number;
+    inShape: number[];
+    outShape: number[];
+    xSeq: Value[][]; // input sequence x_t^(ℓ)
+    hSeq: Value[][]; // hidden sequence h_t^(ℓ)
+    ySeq: Value[][]; // readout sequence y_t^(ℓ)
+    W_x: Value[];
+    W_h: Value[];
+    b: Value[]; // bias for state update
+    W_y: Value[];
+    U_y: Value[];
+    b_y: Value[];
+  };
+
+  const rnnLayers: RnnLayerMeta[] = [];
+
+  let currentInDim = d0;
+  let currentXSeq = xSeq0;
+
+  const mode = initMode ?? 'random';
+  const base = initValue ?? 0;
+  const overrides = paramOverrides ?? {};
+
+  for (let layerIdx = 0; layerIdx < layers; layerIdx++) {
+    const nodeIndex = 1 + layerIdx;
+    const nodeId = `layer-${nodeIndex}`;
+
+    const keyWx = `${nodeId}:W_x`;
+    const keyWh = `${nodeId}:W_h`;
+    const keyB = `${nodeId}:b`;
+    const keyWy = `${nodeId}:W_y`;
+    const keyUy = `${nodeId}:U_y`;
+    const keyBy = `${nodeId}:b_y`;
+    const keyH0 = `${nodeId}:h0`;
+
+    const wXInit = makeInitArray(currentInDim * H, overrides[keyWx], mode, base, 'weight');
+    const wHInit = makeInitArray(H * H, overrides[keyWh], mode, base, 'weight');
+    const bInit = makeInitArray(H, overrides[keyB], mode, base, 'bias');
+
+    const wYInit = makeInitArray(H * H, overrides[keyWy], mode, base, 'weight');
+    const uYInit = makeInitArray(currentInDim * H, overrides[keyUy], mode, base, 'weight');
+    const bYInit = makeInitArray(H, overrides[keyBy], mode, base, 'bias');
+
+    const W_x = wXInit.map((v) => new Value(v, [], 'Weight', 'W_x'));
+    const W_h = wHInit.map((v) => new Value(v, [], 'Weight', 'W_h'));
+    const b = bInit.map((v) => new Value(v, [], 'Bias', 'b'));
+
+    const W_y = wYInit.map((v) => new Value(v, [], 'Weight', 'W_y'));
+    const U_y = uYInit.map((v) => new Value(v, [], 'Weight', 'U_y'));
+    const b_y = bYInit.map((v) => new Value(v, [], 'Bias', 'b_y'));
+
+    const hSeq: Value[][] = [];
+    const ySeq: Value[][] = [];
+    let hPrev: Value[];
+
+    const overrideH0 = overrides[keyH0];
+    const baseH0Vec =
+      (overrideH0 && overrideH0.length ? overrideH0 : undefined) ??
+      (rnnH0 && rnnH0.length ? rnnH0 : undefined);
+
+    if (baseH0Vec && baseH0Vec.length) {
+      hPrev = Array.from(
+        { length: H },
+        (_, j) => new Value(baseH0Vec[j % baseH0Vec.length], [], 'Hidden', `h0_${j}`),
+      );
+    } else {
+      hPrev = Array.from({ length: H }, (_, j) => new Value(0.0, [], 'Hidden', `h0_${j}`));
+    }
+
+    for (let t = 0; t < T; t++) {
+      const xRow = currentXSeq[t];
+      const hRow: Value[] = [];
+      for (let j = 0; j < H; j++) {
+        let sum = new Value(0.0);
+        for (let i = 0; i < currentInDim; i++) {
+          const w = W_x[i * H + j];
+          sum = sum.add(xRow[i].mul(w));
+        }
+        for (let k = 0; k < H; k++) {
+          const w = W_h[k * H + j];
+          sum = sum.add(hPrev[k].mul(w));
+        }
+        const z = sum.add(b[j]);
+        const hVal = z.tanh();
+        hRow.push(hVal);
+      }
+      hSeq.push(hRow);
+      hPrev = hRow;
+
+      const yRow: Value[] = [];
+      for (let j = 0; j < H; j++) {
+        let sum = new Value(0.0);
+        for (let k = 0; k < H; k++) {
+          const w = W_y[k * H + j];
+          sum = sum.add(hRow[k].mul(w));
+        }
+        for (let i = 0; i < currentInDim; i++) {
+          const w = U_y[i * H + j];
+          sum = sum.add(xRow[i].mul(w));
+        }
+        const z = sum.add(b_y[j]);
+        yRow.push(z);
+      }
+      ySeq.push(yRow);
+    }
+
+    rnnLayers.push({
+      label: `RNN ${layerIdx + 1}`,
+      inDim: currentInDim,
+      hiddenDim: H,
+      inShape: [T, currentInDim],
+      outShape: [T, H],
+      xSeq: currentXSeq,
+      hSeq,
+      ySeq,
+      W_x,
+      W_h,
+      b,
+      W_y,
+      U_y,
+      b_y,
+    });
+
+    currentInDim = H;
+    currentXSeq = ySeq;
+  }
+
+  let finalYRow: Value[];
+  if (rnnLayers.length) {
+    const lastLayer = rnnLayers[rnnLayers.length - 1];
+    const ySeqLast = lastLayer.ySeq;
+    finalYRow = ySeqLast[ySeqLast.length - 1];
+  } else {
+    finalYRow = Array.from({ length: H }, (_, j) => new Value(0.0, [], 'Hidden', `yT_${j}`));
+  }
+
+  const sumY = finalYRow.reduce((acc, v) => acc.add(v), new Value(0.0));
+  const yScalar = sumY.mul(1.0 / Math.max(1, finalYRow.length));
+  const target = new Value(1.0);
+  const diff = yScalar.add(target.mul(-1.0));
+  const loss = diff.mul(diff);
+  loss.backward();
+
   const nodes: FrontendNode[] = [];
   const edges: FrontendEdge[] = [];
 
-  const T = Math.max(2, Math.min(8, layers * 2));
   let index = 0;
-  const baseStats = computeTinyRNNStats(initMode, initValue);
 
-  addSequentialNode(
-    nodes,
-    edges,
-    index++,
-    'Input Seq',
-    [T, inputDim],
-    [T, inputDim],
-    {},
-    baseStats.forwardMean,
-    undefined,
-    baseStats.xSample,
-  );
+  const forwardMeanInput = flatInput.length
+    ? flatInput.reduce((s, v) => s + v, 0) / flatInput.length
+    : 0;
 
-  let inDim = inputDim;
-  let lastStats = baseStats;
-  for (let i = 0; i < layers; i++) {
-    const rnnNodeId = `layer-${index}`;
-    const overrides = paramOverrides ?? {};
-    const keyWx = `${rnnNodeId}:W_x`;
-    const keyWh = `${rnnNodeId}:W_h`;
-    const keyB = `${rnnNodeId}:b`;
+  addSequentialNode(nodes, edges, index++, 'Input Seq', [T, d0], [T, d0], {}, forwardMeanInput, undefined, flatInput);
 
-    const agg = (arr: number[] | undefined): number | undefined => {
-      if (!arr || !arr.length) return undefined;
-      const sum = arr.reduce((a, b) => a + b, 0);
-      return sum / arr.length;
-    };
+  const flattenSeq = (seq: Value[][]): number[] => {
+    const out: number[] = [];
+    for (const row of seq) {
+      for (const v of row) {
+        out.push(v.data);
+      }
+    }
+    return out;
+  };
 
-    const overrideWx = agg(overrides[keyWx]);
-    const overrideWh = agg(overrides[keyWh]);
-    const overrideB = agg(overrides[keyB]);
+  const gradMean = (arr: Value[]): number => {
+    if (!arr.length) return 0;
+    let s = 0;
+    for (const v of arr) {
+      s += Math.abs(v.grad);
+    }
+    return s / arr.length;
+  };
 
-    const stats = computeTinyRNNStats(initMode, initValue, overrideWx, overrideWh, overrideB);
-    lastStats = stats;
+  for (const layer of rnnLayers) {
+    const flatX = flattenSeq(layer.xSeq);
+    const flatH = flattenSeq(layer.hSeq);
+
+    const forwardMean = flatH.length ? flatH.reduce((s, v) => s + v, 0) / flatH.length : 0;
+
+    const h0VecForParams =
+      (overrides[`${`layer-${1 + rnnLayers.indexOf(layer)}`}:h0`] &&
+        overrides[`${`layer-${1 + rnnLayers.indexOf(layer)}`}:h0`]!.length
+        ? overrides[`${`layer-${1 + rnnLayers.indexOf(layer)}`}:h0`]
+        : undefined) ?? (rnnH0 && rnnH0.length ? rnnH0 : undefined);
 
     const params: Record<string, ParamInfo> = {
       W_x: {
-        shape: [inDim, hiddenDim],
-        grad_mean: stats.wXGradMean,
+        shape: [layer.inDim, layer.hiddenDim],
+        grad_mean: gradMean(layer.W_x),
         grad_std: 0,
-        value_sample: [stats.wXSample],
+        value_sample: layer.W_x.map((v) => v.data),
       },
       W_h: {
-        shape: [hiddenDim, hiddenDim],
-        grad_mean: stats.wHGradMean,
+        shape: [layer.hiddenDim, layer.hiddenDim],
+        grad_mean: gradMean(layer.W_h),
         grad_std: 0,
-        value_sample: [stats.wHSample],
+        value_sample: layer.W_h.map((v) => v.data),
       },
       b: {
-        shape: [hiddenDim],
-        grad_mean: stats.bGradMean,
+        shape: [layer.hiddenDim],
+        grad_mean: gradMean(layer.b),
         grad_std: 0,
-        value_sample: [stats.bSample],
+        value_sample: layer.b.map((v) => v.data),
+      },
+      h0: {
+        shape: [layer.hiddenDim],
+        grad_mean: 0,
+        grad_std: 0,
+        value_sample:
+          h0VecForParams && h0VecForParams.length
+            ? Array.from({ length: layer.hiddenDim }, (_, j) => h0VecForParams[j % h0VecForParams.length])
+            : Array.from({ length: layer.hiddenDim }, () => 0),
       },
     };
+
+    // Attach readout params (W_y, U_y, b_y) to every RNN layer for visualization.
+    if (rnnLayers.length && layer.W_y.length && layer.U_y.length && layer.b_y.length) {
+      params.W_y = {
+        shape: [layer.hiddenDim, layer.hiddenDim],
+        grad_mean: gradMean(layer.W_y),
+        grad_std: 0,
+        value_sample: layer.W_y.map((v) => v.data),
+      };
+      params.U_y = {
+        shape: [layer.inDim, layer.hiddenDim],
+        grad_mean: gradMean(layer.U_y),
+        grad_std: 0,
+        value_sample: layer.U_y.map((v) => v.data),
+      };
+      params.b_y = {
+        shape: [layer.hiddenDim],
+        grad_mean: gradMean(layer.b_y),
+        grad_std: 0,
+        value_sample: layer.b_y.map((v) => v.data),
+      };
+    }
+
     addSequentialNode(
       nodes,
       edges,
       index++,
-      `RNN ${i + 1}`,
-      [T, inDim],
-      [T, hiddenDim],
+      layer.label,
+      layer.inShape,
+      layer.outShape,
       params,
-      stats.forwardMean,
-      stats.xSample,
-      stats.hSample,
+      forwardMean,
+      flatX,
+      flatH,
     );
-    inDim = hiddenDim;
   }
 
-  const finalH = lastStats.hSample.length ? lastStats.hSample[lastStats.hSample.length - 1] : 0;
-  addSequentialNode(
-    nodes,
-    edges,
-    index++,
-    'Final h_T',
-    [T, hiddenDim],
-    [hiddenDim],
-    {},
-    finalH,
-    lastStats.hSample,
-    [finalH],
-  );
+  const lastHiddenDim = currentInDim;
 
-  addSequentialNode(
-    nodes,
-    edges,
-    index++,
-    'Loss',
-    [hiddenDim],
-    [1],
-    {},
-    lastStats.lossSample,
-    [finalH],
-    [lastStats.lossSample],
-  );
+  const finalYData = finalYRow.map((v) => v.data);
+  const forwardMeanY = finalYData.length
+    ? finalYData.reduce((s, v) => s + v, 0) / finalYData.length
+    : 0;
 
-  return { nodes, edges, loss: lastStats.lossSample };
+  addSequentialNode(nodes, edges, index++, 'y_t', [lastHiddenDim], [lastHiddenDim], {}, forwardMeanY, finalYData, finalYData);
+
+  const lossVal = loss.data;
+
+  addSequentialNode(nodes, edges, index++, 'Loss', [lastHiddenDim], [1], {}, lossVal, finalYData, [lossVal]);
+
+  return { nodes, edges, loss: lossVal };
 }
-
-// --- Transformer: conceptual encoder stack ---
 
 function runTransformer(config: BackpropConfig): BackpropResult {
   const { layers, hiddenDim, inputDim, initMode, initValue, paramOverrides } = config;

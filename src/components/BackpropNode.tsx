@@ -4,7 +4,7 @@ import { Handle, Position } from 'reactflow';
 import Latex from 'react-latex-next';
 import 'katex/dist/katex.min.css';
 
-import type { LayerDetails } from '../engine';
+import type { LayerDetails, ParamInfo } from '../engine';
 
 function valueToColor(v: number): string {
   const clamp = (x: number) => Math.max(-1, Math.min(1, x));
@@ -43,7 +43,7 @@ const EQ_MAP: Record<string, string> = {
   Flatten: 'y = \\mathrm{vec}(x)',
 
   // RNN
-  RNN: 'h_t = \\sigma(W_h h_{t-1} + W_x x_t + b) \\ y_t = h_t',
+  RNN: 'h_t = \\sigma(W_h h_{t-1} + W_x x_t + b_h) \\\\ y_t = W_y h_t + U_y x_t + b_y',
 
   LayerNorm: '\\hat{x} = \\frac{x - \\mu}{\\sigma + \\epsilon},\\quad y = \\gamma \\hat{x} + \\beta',
   BatchNorm:
@@ -59,6 +59,7 @@ const EQ_MAP: Record<string, string> = {
 export type BackpropNodeData = {
   label: string;
   details: LayerDetails;
+  rnnStep?: number;
 };
 
 function getEqKey(label: string): string {
@@ -81,7 +82,7 @@ function getEqKey(label: string): string {
 }
 
 export default function BackpropNode({ data, selected }: NodeProps<BackpropNodeData>) {
-  const { label, details } = data;
+  const { label, details, rnnStep } = data;
 
   const isActivation = ['ReLU', 'Tanh', 'Sigmoid'].some((p) => label.startsWith(p));
   const isLoss = label === 'Loss' || label === 'MSELoss';
@@ -124,6 +125,12 @@ export default function BackpropNode({ data, selected }: NodeProps<BackpropNodeD
   const maxStepsViz = 8;
   const visibleSteps = seqLen ? Math.min(seqLen, maxStepsViz) : 4;
 
+  const rawSeqLen = typeof seqLen === 'number' && seqLen > 0 ? seqLen : visibleSteps;
+  const activeRnnStep =
+    rawSeqLen > 0 && typeof rnnStep === 'number'
+      ? ((rnnStep % rawSeqLen) + rawSeqLen) % rawSeqLen
+      : 0;
+
   const rnnInputDim =
     isRNN && Array.isArray(details.in_shape) && details.in_shape.length >= 2
       ? details.in_shape[1]
@@ -133,6 +140,15 @@ export default function BackpropNode({ data, selected }: NodeProps<BackpropNodeD
       ? details.out_shape[1]
       : undefined;
 
+  let rnnH0Vals: number[] | undefined;
+  if (isRNN && details.params) {
+    const params = details.params as Record<string, ParamInfo>;
+    const h0Info = params.h0;
+    if (h0Info && h0Info.value_sample && h0Info.value_sample.length) {
+      rnnH0Vals = h0Info.value_sample;
+    }
+  }
+
   const [convStep, setConvStep] = useState(0);
   const [attnHead, setAttnHead] = useState(0);
 
@@ -141,21 +157,30 @@ export default function BackpropNode({ data, selected }: NodeProps<BackpropNodeD
 
     let Hin = 4;
     let Win = 4;
-    if (Array.isArray(details.in_shape) && details.in_shape.length >= 3) {
-      const shape = details.in_shape as number[];
-      Hin = Math.min(8, Math.max(3, shape[shape.length - 2] ?? 4));
-      Win = Math.min(8, Math.max(3, shape[shape.length - 1] ?? 4));
+    let Hout = 2;
+    let Wout = 2;
+
+    if (
+      Array.isArray(details.in_shape) &&
+      details.in_shape.length >= 3 &&
+      Array.isArray(details.out_shape) &&
+      details.out_shape.length >= 3
+    ) {
+      const inShape = details.in_shape as number[];
+      const outShape = details.out_shape as number[];
+      Hin = Math.min(8, Math.max(2, inShape[1] ?? 4));
+      Win = Math.min(8, Math.max(2, inShape[2] ?? 4));
+      Hout = Math.min(8, Math.max(1, outShape[1] ?? 2));
+      Wout = Math.min(8, Math.max(1, outShape[2] ?? 2));
     }
 
-    const maxR0 = Math.max(1, Hin - 2);
-    const maxC0 = Math.max(1, Win - 2);
-    const totalPositions = Math.max(1, maxR0 * maxC0);
+    const totalPositions = Math.max(1, Hout * Wout);
 
     const id = window.setInterval(() => {
       setConvStep((s) => (s + 1) % totalPositions);
     }, 900);
     return () => window.clearInterval(id);
-  }, [label, details.in_shape]);
+  }, [label, details.in_shape, details.out_shape]);
 
   useEffect(() => {
     setAttnHead(0);
@@ -287,8 +312,8 @@ export default function BackpropNode({ data, selected }: NodeProps<BackpropNodeD
               const shape = Array.isArray(details.out_shape)
                 ? (details.out_shape as number[])
                 : [1, 4, 4];
-              const H = Math.max(1, Math.min(8, shape[1] ?? 4));
-              const W = Math.max(1, Math.min(8, shape[2] ?? 4));
+              const H = Math.max(1, Math.min(8, shape[shape.length - 2] ?? 4));
+              const W = Math.max(1, Math.min(8, shape[shape.length - 1] ?? 4));
               const vals = (details.output_sample as number[]) || [];
 
               const cells: JSX.Element[] = [];
@@ -355,43 +380,66 @@ export default function BackpropNode({ data, selected }: NodeProps<BackpropNodeD
         <div className="mb-2">
           <div className="flex justify-between items-center mb-1">
             <span className="text-[10px] font-bold text-sky-400 uppercase tracking-wider">Conv maps</span>
-            {Array.isArray(details.in_shape) && details.in_shape.length === 3 && (
-              <span className="text-[9px] text-slate-400 font-mono">
-                in: {details.in_shape[1]}×{details.in_shape[2]} · out:
-                {Array.isArray(details.out_shape) && details.out_shape.length === 3
-                  ? ` ${details.out_shape[1]}×${details.out_shape[2]}`
-                  : ' ?×?'}
-              </span>
-            )}
+            {Array.isArray(details.in_shape) &&
+              details.in_shape.length === 3 &&
+              Array.isArray(details.out_shape) &&
+              details.out_shape.length === 3 &&
+              (() => {
+                const inShape = details.in_shape as number[];
+                const outShape = details.out_shape as number[];
+                const Hin = inShape[1] ?? 0;
+                const Win = inShape[2] ?? 0;
+                const Hout = outShape[1] ?? 0;
+                const Wout = outShape[2] ?? 0;
+                const Kh = Hin && Hout ? Hin - Hout + 1 : 0;
+                const Kw = Win && Wout ? Win - Wout + 1 : 0;
+                const K = Kh > 0 && Kh === Kw ? Kh : 3;
+                return (
+                  <div className="flex flex-col items-end leading-tight">
+                    <span className="text-[9px] text-slate-400 font-mono">
+                      in: {Hin}×{Win} · out: {Hout}×{Wout}
+                    </span>
+                    <span className="text-[8px] text-slate-500 font-mono">
+                      {K}×{K} kernel · stride 1 · padding 0
+                    </span>
+                  </div>
+                );
+              })()}
           </div>
           <div className="flex items-center gap-4">
             {(() => {
               let Hin = 4;
               let Win = 4;
-              if (Array.isArray(details.in_shape) && details.in_shape.length === 3) {
+              let Hout = 2;
+              let Wout = 2;
+              if (
+                Array.isArray(details.in_shape) &&
+                details.in_shape.length === 3 &&
+                Array.isArray(details.out_shape) &&
+                details.out_shape.length === 3
+              ) {
                 Hin = Math.min(8, Math.max(2, details.in_shape[1] ?? 4));
                 Win = Math.min(8, Math.max(2, details.in_shape[2] ?? 4));
+                Hout = Math.min(8, Math.max(1, details.out_shape[1] ?? 2));
+                Wout = Math.min(8, Math.max(1, details.out_shape[2] ?? 2));
               }
 
-              let Hout = 4;
-              let Wout = 4;
-              if (Array.isArray(details.out_shape) && details.out_shape.length === 3) {
-                Hout = Math.min(8, Math.max(2, details.out_shape[1] ?? 4));
-                Wout = Math.min(8, Math.max(2, details.out_shape[2] ?? 4));
-              }
+              const Kh = Hin && Hout ? Hin - Hout + 1 : 0;
+              const Kw = Win && Wout ? Win - Wout + 1 : 0;
+              const K = Kh > 0 && Kh === Kw ? Kh : 3;
 
               const inputCells: JSX.Element[] = [];
               const outputCells: JSX.Element[] = [];
 
-              // Compute top-left of the 3x3 kernel from convStep so it sweeps the whole map.
-              const maxR0 = Math.max(1, Hin - 2);
-              const maxC0 = Math.max(1, Win - 2);
-              const r0 = Math.floor(convStep % (maxR0 * maxC0) / maxC0);
-              const c0 = convStep % maxC0;
+              // Sweep the valid conv positions: r0,c0 are top-left of KxK window on input.
+              const totalPositions = Math.max(1, Hout * Wout);
+              const pos = ((convStep % totalPositions) + totalPositions) % totalPositions;
+              const r0 = Math.floor(pos / Wout);
+              const c0 = pos % Wout;
 
               for (let r = 0; r < Hin; r++) {
                 for (let c = 0; c < Win; c++) {
-                  const inKernel = r >= r0 && r <= r0 + 2 && c >= c0 && c <= c0 + 2;
+                  const inKernel = r >= r0 && r < r0 + K && c >= c0 && c < c0 + K;
                   inputCells.push(
                     <div
                       key={`in-${r}-${c}`}
@@ -434,8 +482,11 @@ export default function BackpropNode({ data, selected }: NodeProps<BackpropNodeD
                   </div>
                   <div className="flex flex-col items-center gap-1">
                     <span className="text-[9px] text-slate-400 font-mono">kernel</span>
-                    <div className="grid grid-cols-3 gap-[2px]">
-                      {Array.from({ length: 9 }).map((_, i) => (
+                    <div
+                      className="grid gap-[2px]"
+                      style={{ gridTemplateColumns: `repeat(${Math.min(K, 5)}, minmax(0, 1fr))` }}
+                    >
+                      {Array.from({ length: Math.min(K * K, 25) }).map((_, i) => (
                         <div
                           key={i}
                           className="w-3 h-3 rounded-sm border border-amber-400 bg-amber-500/80"
@@ -536,6 +587,29 @@ export default function BackpropNode({ data, selected }: NodeProps<BackpropNodeD
                   ))}
             </div>
           </div>
+
+          {rnnH0Vals && rnnH0Vals.length > 0 && (
+            <div className="mt-2">
+              <div className="flex justify-between items-center mb-1">
+                <span className="text-[9px] text-slate-400 font-mono">Initial h_0</span>
+                <span className="text-[9px] text-slate-500 font-mono">
+                  H={rnnHiddenDim ?? rnnH0Vals.length}
+                </span>
+              </div>
+              <div className="flex gap-[1px]">
+                {rnnH0Vals.slice(0, Math.min(rnnH0Vals.length, 8)).map((v, i) => (
+                  <div
+                    key={i}
+                    className="w-2 h-3 rounded-sm border border-slate-600"
+                    style={{ backgroundColor: valueToColor(v) }}
+                  />
+                ))}
+                {rnnH0Vals.length > 8 && (
+                  <span className="text-[8px] text-slate-500 font-mono ml-1">…</span>
+                )}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -551,19 +625,135 @@ export default function BackpropNode({ data, selected }: NodeProps<BackpropNodeD
             <div className="flex items-center gap-1">
               <span className="text-[9px] text-slate-400 font-mono w-6">h_t</span>
               <div className="flex gap-0.5">
-                {Array.from({ length: visibleSteps }).map((_, i) => (
-                  <div
-                    key={i}
-                    className={`w-3 h-3 rounded-sm border ${
-                      i === visibleSteps - 1
-                        ? 'bg-amber-500/80 border-amber-300'
-                        : 'bg-slate-800 border-slate-700'
-                    }`}
-                  />
-                ))}
+                {Array.from({ length: visibleSteps }).map((_, i) => {
+                  const isActive = i === activeRnnStep;
+                  return (
+                    <div
+                      key={i}
+                      className={`w-3 h-3 rounded-sm border ${
+                        isActive
+                          ? 'bg-amber-500/80 border-amber-300'
+                          : 'bg-slate-800/60 border-slate-700/70 opacity-40'
+                      }`}
+                    />
+                  );
+                })}
                 {seqLen && seqLen > maxStepsViz && (
                   <span className="text-[9px] text-slate-500 font-mono ml-1">…</span>
                 )}
+              </div>
+            </div>
+            <div className="flex items-center gap-1">
+              <span className="text-[9px] text-slate-400 font-mono w-6">y_t</span>
+              <div className="flex gap-0.5">
+                {(() => {
+                  const count = Math.min(rnnHiddenDim ?? 4, 5);
+                  const vals: number[] = [];
+
+                  if (
+                    isRNN &&
+                    typeof seqLen === 'number' &&
+                    seqLen > 0 &&
+                    rnnInputDim &&
+                    rnnHiddenDim &&
+                    Array.isArray(details.in_shape) &&
+                    details.in_shape.length >= 2 &&
+                    Array.isArray(details.out_shape) &&
+                    details.out_shape.length >= 2 &&
+                    details.input_sample &&
+                    details.output_sample
+                  ) {
+                    const T = seqLen;
+                    const d = rnnInputDim;
+                    const H = rnnHiddenDim;
+                    const flatIn = details.input_sample as number[];
+                    const flatH = details.output_sample as number[];
+
+                    const getRow = (flat: number[], rowLen: number, t: number): number[] => {
+                      if (rowLen <= 0) return [];
+                      if (!flat.length) {
+                        return Array.from({ length: rowLen }, () => 0);
+                      }
+                      const tClamped = ((t % T) + T) % T;
+                      const start = tClamped * rowLen;
+                      const end = start + rowLen;
+                      if (end <= flat.length) {
+                        return flat.slice(start, end);
+                      }
+                      const row: number[] = [];
+                      for (let j = 0; j < rowLen; j++) {
+                        const idx = (start + j) % flat.length;
+                        row.push(flat[idx]);
+                      }
+                      return row;
+                    };
+
+                    const xRow = getRow(flatIn, d, activeRnnStep);
+                    const hRow = getRow(flatH, H, activeRnnStep);
+
+                    const params = (details.params || {}) as Record<string, ParamInfo>;
+                    const Wy = params.W_y;
+                    const Uy = params.U_y;
+                    const By = params.b_y;
+
+                    let yRow: number[];
+                    if (
+                      Wy &&
+                      Uy &&
+                      By &&
+                      Array.isArray(Wy.shape) &&
+                      Wy.shape.length === 2 &&
+                      Array.isArray(Uy.shape) &&
+                      Uy.shape.length === 2 &&
+                      Array.isArray(By.shape) &&
+                      By.shape.length === 1 &&
+                      Wy.value_sample.length &&
+                      Uy.value_sample.length &&
+                      By.value_sample.length &&
+                      Wy.shape[0] === H &&
+                      Wy.shape[1] === H &&
+                      Uy.shape[0] === d &&
+                      Uy.shape[1] === H &&
+                      By.shape[0] === H
+                    ) {
+                      const wyVals = Wy.value_sample;
+                      const uyVals = Uy.value_sample;
+                      const byVals = By.value_sample;
+                      yRow = [];
+                      for (let j = 0; j < H; j++) {
+                        let sum = 0;
+                        for (let k = 0; k < H; k++) {
+                          const w = wyVals[k * H + j] ?? 0;
+                          sum += (hRow[k] ?? 0) * w;
+                        }
+                        for (let i = 0; i < d; i++) {
+                          const w = uyVals[i * H + j] ?? 0;
+                          sum += (xRow[i] ?? 0) * w;
+                        }
+                        sum += byVals[j] ?? 0;
+                        yRow.push(sum);
+                      }
+                    } else {
+                      yRow = hRow;
+                    }
+
+                    for (let i = 0; i < count; i++) {
+                      vals.push(yRow[i] ?? 0);
+                    }
+                  } else {
+                    for (let i = 0; i < count; i++) {
+                      vals.push(0);
+                    }
+                  }
+
+                  return Array.from({ length: count }).map((_, i) => (
+                    <div
+                      key={i}
+                      className="w-3 h-3 rounded-sm"
+                      style={{ backgroundColor: valueToColor(vals[i] ?? 0) }}
+                    />
+                  ));
+                })()}
               </div>
             </div>
           </div>
@@ -572,7 +762,9 @@ export default function BackpropNode({ data, selected }: NodeProps<BackpropNodeD
             <div className="mb-1 flex justify-between items-center">
               <span className="text-[9px] text-slate-400 font-mono">RNN step</span>
               {seqLen && (
-                <span className="text-[9px] text-slate-500 font-mono">t = 1 … {seqLen}</span>
+                <span className="text-[9px] text-slate-500 font-mono">
+                  t = {activeRnnStep + 1} / {seqLen}
+                </span>
               )}
             </div>
             <div className="flex items-center justify-between text-[9px] font-mono text-slate-300">
@@ -666,7 +858,7 @@ export default function BackpropNode({ data, selected }: NodeProps<BackpropNodeD
                 <span>
                   <Latex>{`$\\frac{\\partial L}{\\partial ${latexKey}}$`}</Latex>
                 </span>
-                <span className="text-rose-300">{val.grad_mean.toFixed(4)}</span>
+                <span className="text-rose-300">IN PROGRESS</span>
               </div>
             );
           })}

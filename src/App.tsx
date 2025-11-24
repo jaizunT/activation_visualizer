@@ -152,6 +152,7 @@ export default function App() {
   const [layers, setLayers] = useState(2);
   const [hiddenDim, setHiddenDim] = useState(16);
   const [inputDim, setInputDim] = useState(10);
+  const [seqLen, setSeqLen] = useState(4);
   const [loading, setLoading] = useState(false);
   const [activation, setActivation] = useState<Activation>('ReLU');
   const [architecture, setArchitecture] = useState<Architecture>('mlp');
@@ -174,6 +175,7 @@ export default function App() {
   const [isAddingResidual, setIsAddingResidual] = useState(false);
   const [residualSourceId, setResidualSourceId] = useState<string | null>(null);
   const [paramOverrides, setParamOverrides] = useState<Record<string, number[]>>({});
+  const [frozenParams, setFrozenParams] = useState<Record<string, number[]>>({});
   const [editingParam, setEditingParam] = useState<ParamChip | null>(null);
   const [editingParamValue, setEditingParamValue] = useState<number | null>(null);
   const [editingParamValues, setEditingParamValues] = useState<number[] | null>(null);
@@ -182,6 +184,9 @@ export default function App() {
   const [pinnedInputIndex, setPinnedInputIndex] = useState<number | null>(null);
   const [hoveredParamIndex, setHoveredParamIndex] = useState<number | null>(null);
   const [pinnedParamIndex, setPinnedParamIndex] = useState<number | null>(null);
+  const [rnnStep, setRnnStep] = useState(0);
+  const [rnnH0, setRnnH0] = useState<number[]>([]);
+  const [activeH0Index, setActiveH0Index] = useState<number | null>(null);
 
   const activeInputIndex = pinnedInputIndex ?? hoveredInputIndex;
   const activeParamIndex = pinnedParamIndex ?? hoveredParamIndex;
@@ -191,12 +196,22 @@ export default function App() {
       const size = Math.max(4, Math.min(8, inputDim || 4));
       return size * size;
     }
+    if (architecture === 'rnn') {
+      const T = Math.max(1, Math.min(4, seqLen || 1));
+      const d = inputDim || 1;
+      return T * d;
+    }
     return inputDim;
-  }, [architecture, inputDim]);
+  }, [architecture, inputDim, seqLen]);
 
   const runSimulation = useCallback(() => {
     setLoading(true);
     try {
+      const mergedOverrides: Record<string, number[]> = {
+        ...frozenParams,
+        ...paramOverrides,
+      };
+
       const { nodes: rawNodes, edges: rawEdges } = runBackpropSimulation({
         architecture,
         layers,
@@ -208,7 +223,32 @@ export default function App() {
         initValue,
         inputValue,
         inputVector,
-        paramOverrides,
+        paramOverrides: mergedOverrides,
+        seqLen,
+        rnnH0,
+      });
+
+      // If we don't yet have a frozen parameter snapshot, capture one from this run.
+      setFrozenParams((prev) => {
+        if (Object.keys(prev).length > 0) return prev;
+
+        const next: Record<string, number[]> = {};
+        for (const node of rawNodes) {
+          const data = node.data as { details?: LayerDetails } | undefined;
+          const details = data?.details;
+          if (!details || !details.params) continue;
+          const params = details.params as Record<string, ParamInfo>;
+          Object.entries(params).forEach(([paramName, info]) => {
+            if (!info.value_sample || !info.value_sample.length) return;
+            const key = `${node.id}:${paramName}`;
+            if (next[key] === undefined) {
+              next[key] = info.value_sample.slice();
+            }
+          });
+        }
+
+        if (!Object.keys(next).length) return prev;
+        return next;
       });
 
       const applyParamOverrides = (nodeList: typeof rawNodes) => {
@@ -224,7 +264,7 @@ export default function App() {
           const nextParams: Record<string, ParamInfo> = { ...params };
           Object.keys(nextParams).forEach((paramName) => {
             const key = `${node.id}:${paramName}`;
-            const overrideVals = paramOverrides[key];
+            const overrideVals = mergedOverrides[key];
             if (overrideVals && overrideVals.length) {
               nextParams[paramName] = {
                 ...nextParams[paramName],
@@ -287,6 +327,9 @@ export default function App() {
     setNodes,
     setEdges,
     paramOverrides,
+    frozenParams,
+    seqLen,
+    rnnH0,
   ]);
 
   useEffect(() => {
@@ -304,7 +347,50 @@ export default function App() {
     inputValue,
     inputVector,
     paramOverrides,
+    seqLen,
+    rnnH0,
   ]);
+
+  useEffect(() => {
+    if (architecture !== 'rnn') return;
+    const T = Math.max(1, Math.min(4, seqLen || 1));
+    const id = window.setInterval(() => {
+      setRnnStep((s) => ((s + 1) % T + T) % T);
+    }, 900);
+    return () => window.clearInterval(id);
+  }, [architecture, seqLen]);
+
+  useEffect(() => {
+    if (architecture !== 'rnn') {
+      setRnnH0([]);
+      return;
+    }
+    const H = Math.max(1, hiddenDim || 1);
+    setRnnH0((prev) => {
+      const next = Array.from({ length: H }, (_, i) => prev[i] ?? 0);
+      return next;
+    });
+  }, [architecture, hiddenDim]);
+
+  useEffect(() => {
+    if (architecture !== 'rnn') return;
+    setNodes((prev) =>
+      prev.map((node) => {
+        const data = node.data as {
+          label?: string;
+          details?: LayerDetails;
+          rnnStep?: number;
+        };
+        return {
+          ...node,
+          data: {
+            ...data,
+            rnnStep,
+          },
+        };
+      }),
+    );
+  }, [architecture, rnnStep, setNodes]);
 
   const highlightPathTo = useCallback(
     (nodeId: string | null) => {
@@ -369,7 +455,6 @@ export default function App() {
     [activeParam, activeNodeParams, architecture],
   );
 
-  // Chain-rule overlay: hover takes precedence, but when nothing is hovered fall back to pinned.
   const effectiveLayerLabel = activeLayerLabel
     ? activeLayerLabel
     : pinnedNodeId
@@ -411,71 +496,179 @@ export default function App() {
       return { inVec: baseVec, outVec: baseVec };
     }
 
-    // CNN: build a simple per-layer forward pipeline over nodes so different conv/activation
-    // layers see different inputs/outputs.
-    if (architecture === 'cnn' && effectiveLayerLabel) {
-      const side = Math.max(4, Math.min(8, inputDim || 4));
-      const total = side * side;
-
-      const baseInput =
-        inputVector.length >= total
-          ? inputVector.slice(0, total)
-          : (() => {
-              const pad = Array.from({ length: total - inputVector.length }, () => inputValue);
-              return [...inputVector, ...pad];
-            })();
-
-      // Sort nodes by layer index so we walk them in forward order.
-      const ordered = [...nodes].sort((a, b) => {
-        const ia = parseInt(String(a.id).replace('layer-', ''), 10);
-        const ib = parseInt(String(b.id).replace('layer-', ''), 10);
-        if (Number.isNaN(ia) || Number.isNaN(ib)) return 0;
-        return ia - ib;
+    if (architecture === 'rnn' && effectiveLayerLabel === 'y_t') {
+      const rnnNodes = nodes.filter((n) => {
+        const data = n.data as { label?: string; details?: LayerDetails } | undefined;
+        const lbl = data?.label ?? '';
+        return lbl.startsWith('RNN');
       });
 
-      let map: number[] = baseInput;
+      if (rnnNodes.length) {
+        const last = rnnNodes[rnnNodes.length - 1];
+        const lastDetails = (last.data as { details?: LayerDetails }).details;
 
-      for (const node of ordered) {
-        const data = node.data as { label?: string; details?: LayerDetails };
-        const label = data?.label ?? node.id;
-        const details = data?.details;
+        if (lastDetails && Array.isArray(lastDetails.in_shape) && Array.isArray(lastDetails.out_shape)) {
+          let T = typeof lastDetails.in_shape[0] === 'number' ? lastDetails.in_shape[0] : 0;
+          let d = typeof lastDetails.in_shape[1] === 'number' ? lastDetails.in_shape[1] : 0;
+          let H = typeof lastDetails.out_shape[1] === 'number' ? lastDetails.out_shape[1] : 0;
 
-        const before = map;
-        let after = before;
-
-        if (details) {
-          if (label.startsWith('Conv')) {
-            const params = (details.params || {}) as Record<string, ParamInfo>;
-            const wInfo = params.W;
-            const bInfo = params.b;
-            const w = wInfo && wInfo.value_sample && wInfo.value_sample.length
-              ? wInfo.value_sample[0]
-              : 1;
-            const b = bInfo && bInfo.value_sample && bInfo.value_sample.length
-              ? bInfo.value_sample[0]
-              : 0;
-            after = before.map((v) => w * v + b);
-          } else if (label.startsWith('ReLU')) {
-            after = before.map((v) => (v < 0 ? 0 : v));
-          } else if (label.startsWith('Tanh')) {
-            after = before.map((v) => Math.tanh(v));
-          } else if (label.startsWith('Sigmoid')) {
-            after = before.map((v) => 1 / (1 + Math.exp(-v)));
-          } else {
-            // Other CNN layers: keep map unchanged for now.
-            after = before;
+          if (!T) {
+            T = Math.max(1, Math.min(4, seqLen || 1));
           }
-        }
+          if (!d) {
+            d = Math.max(1, Math.min(16, inputDim || 1));
+          }
+          if (!H) {
+            H = Math.max(1, Math.min(16, hiddenDim || 1));
+          }
 
-        if (label === effectiveLayerLabel) {
-          return { inVec: before, outVec: after };
-        }
+          const tActive = ((rnnStep % T) + T) % T;
+          const flatIn = (lastDetails.input_sample || []) as number[];
+          const flatH = (lastDetails.output_sample || []) as number[];
 
-        map = after;
+          const getRow = (flatArr: number[], rowLen: number, t: number): number[] => {
+            if (rowLen <= 0) return [];
+            if (!flatArr.length) {
+              return Array.from({ length: rowLen }, () => 0);
+            }
+            const start = t * rowLen;
+            const end = start + rowLen;
+            if (end <= flatArr.length) {
+              return flatArr.slice(start, end);
+            }
+            const row: number[] = [];
+            for (let j = 0; j < rowLen; j++) {
+              const idx = (start + j) % flatArr.length;
+              row.push(flatArr[idx]);
+            }
+            return row;
+          };
+
+          const xRow = getRow(flatIn, d, tActive);
+          const hRow = getRow(flatH, H, tActive);
+
+          const params = (lastDetails.params || {}) as Record<string, ParamInfo>;
+          const Wy = params.W_y;
+          const Uy = params.U_y;
+          const By = params.b_y;
+
+          const computeY = (): number[] => {
+            if (
+              Wy && Uy && By &&
+              Array.isArray(Wy.shape) && Wy.shape.length === 2 &&
+              Array.isArray(Uy.shape) && Uy.shape.length === 2 &&
+              Array.isArray(By.shape) && By.shape.length === 1 &&
+              Wy.value_sample.length &&
+              Uy.value_sample.length &&
+              By.value_sample.length &&
+              Wy.shape[0] === H &&
+              Wy.shape[1] === H &&
+              Uy.shape[0] === d &&
+              Uy.shape[1] === H &&
+              By.shape[0] === H
+            ) {
+              const y: number[] = [];
+              const wyVals = Wy.value_sample;
+              const uyVals = Uy.value_sample;
+              const byVals = By.value_sample;
+              for (let j = 0; j < H; j++) {
+                let sum = 0;
+                for (let k = 0; k < H; k++) {
+                  const w = wyVals[k * H + j] ?? 0;
+                  sum += (hRow[k] ?? 0) * w;
+                }
+                for (let i = 0; i < d; i++) {
+                  const w = uyVals[i * H + j] ?? 0;
+                  sum += (xRow[i] ?? 0) * w;
+                }
+                sum += byVals[j] ?? 0;
+                y.push(sum);
+              }
+              return y;
+            }
+            return hRow;
+          };
+
+          const yRow = computeY();
+
+          return {
+            inVec: yRow.slice(0, cap),
+            outVec: yRow.slice(0, cap),
+          };
+        }
       }
     }
 
-    // Prefer true forward-pass samples from the engine whenever available for non-input layers
+    if (
+      architecture === 'rnn' &&
+      effectiveLayerLabel &&
+      effectiveLayerLabel.startsWith('RNN') &&
+      activeLayerDetails
+    ) {
+      const inShape = activeLayerDetails.in_shape as number[] | string;
+      const outShape = activeLayerDetails.out_shape as number[] | string;
+
+      let T = 0;
+      let d = 0;
+      let H = 0;
+
+      if (Array.isArray(inShape) && inShape.length >= 2) {
+        T = typeof inShape[0] === 'number' ? inShape[0] : 0;
+        d = typeof inShape[1] === 'number' ? inShape[1] : 0;
+      }
+      if (Array.isArray(outShape) && outShape.length >= 2) {
+        if (!T) {
+          T = typeof outShape[0] === 'number' ? outShape[0] : 0;
+        }
+        H = typeof outShape[1] === 'number' ? outShape[1] : 0;
+      }
+
+      if (!T) {
+        T = Math.max(1, Math.min(4, seqLen || 1));
+      }
+      if (!d) {
+        d = Math.max(1, Math.min(16, inputDim || 1));
+      }
+      if (!H) {
+        H = Math.max(1, Math.min(16, hiddenDim || 1));
+      }
+
+      const tActive = ((rnnStep % T) + T) % T;
+
+      const flatIn = (activeLayerDetails.input_sample && activeLayerDetails.input_sample.length
+        ? activeLayerDetails.input_sample
+        : activeLayerDetails.output_sample || []) as number[];
+      const flatOut = (activeLayerDetails.output_sample && activeLayerDetails.output_sample.length
+        ? activeLayerDetails.output_sample
+        : activeLayerDetails.input_sample || []) as number[];
+
+      const getRow = (flat: number[], rowLen: number, t: number): number[] => {
+        if (rowLen <= 0) return [];
+        if (!flat.length) {
+          return Array.from({ length: rowLen }, () => 0);
+        }
+        const start = t * rowLen;
+        const end = start + rowLen;
+        if (end <= flat.length) {
+          return flat.slice(start, end);
+        }
+        const row: number[] = [];
+        for (let j = 0; j < rowLen; j++) {
+          const idx = (start + j) % flat.length;
+          row.push(flat[idx]);
+        }
+        return row;
+      };
+
+      const xRow = getRow(flatIn, d, tActive);
+      const hRow = getRow(flatOut, H, tActive);
+
+      return {
+        inVec: xRow.slice(0, cap),
+        outVec: hRow.slice(0, cap),
+      };
+    }
+
     const inSample = activeLayerDetails.input_sample;
     const outSample = activeLayerDetails.output_sample;
 
@@ -489,7 +682,6 @@ export default function App() {
       return { inVec, outVec };
     }
 
-    // Fallback: synthetic vectors based on shapes and forward_mean
     const getDim = (shape: number[] | string | undefined): number => {
       if (!shape || typeof shape === 'string') return 4;
       if (Array.isArray(shape) && shape.length >= 2) {
@@ -540,6 +732,9 @@ export default function App() {
     inputDim,
     inputValue,
     nodes,
+    seqLen,
+    hiddenDim,
+    rnnStep,
   ]);
 
   const renderVector = useCallback(
@@ -607,7 +802,7 @@ export default function App() {
         const label = getLabel(n);
         if (label === 'Loss') return false;
         if (label === 'Output') return true;
-        if (label.startsWith('Final h_T')) return true;
+        if (label === 'y_t') return true;
         if (label.startsWith('Encoder Output')) return true;
         return false;
       }) ?? nodes[nodes.length - 1];
@@ -630,7 +825,6 @@ export default function App() {
       inputLabel.startsWith('Token') ||
       inputLabel.startsWith('Positional');
 
-    // Prefer editable inputVector for input-like nodes so the IO bar matches the slider
     let inVec: number[];
     if (isInputLikeNode) {
       const srcDimBase = inputDim || inputVector.length || lenIn || 1;
@@ -943,7 +1137,7 @@ export default function App() {
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2">
             <Activity className="text-blue-500" />
-            <h1 className="font-bold text-xl tracking-tight">Backprop Visualizer</h1>
+            <h1 className="font-bold text-xl tracking-tight">Activation Visualizer</h1>
           </div>
           <button
             type="button"
@@ -965,7 +1159,9 @@ export default function App() {
             />
           </div>
           <div className="flex items-center gap-2 px-3">
-            <span className="text-xs text-slate-400">Dim:</span>
+            <span className="text-xs text-slate-400">
+              {architecture === 'cnn' ? 'Kernel (K):' : 'Dim:'}
+            </span>
             <input
               type="number"
               value={hiddenDim}
@@ -975,7 +1171,11 @@ export default function App() {
           </div>
           <div className="flex items-center gap-2 px-3">
             <span className="text-xs text-slate-400">
-              {architecture === 'cnn' ? 'Input Dim (H=W):' : 'Input Dim:'}
+              {architecture === 'cnn'
+                ? 'Input Dim (H=W):'
+                : architecture === 'rnn'
+                ? 'Input Dim (d):'
+                : 'Input Dim:'}
             </span>
             <input
               type="number"
@@ -984,12 +1184,15 @@ export default function App() {
               max={architecture === 'cnn' ? 8 : 16}
               onChange={(e) => {
                 const raw = Number(e.target.value) || 1;
-                const minDim = architecture === 'cnn' ? 4 : 1;
-                const maxDim = architecture === 'cnn' ? 8 : 16;
-                const side = Math.max(minDim, Math.min(maxDim, raw));
-                setInputDim(side);
+                const isCNN = architecture === 'cnn';
+                const isRNN = architecture === 'rnn';
+                const minDim = isCNN ? 4 : 1;
+                const maxDim = isCNN ? 8 : 16;
+                const dim = Math.max(minDim, Math.min(maxDim, raw));
+                setInputDim(dim);
 
-                const dimForVector = architecture === 'cnn' ? side * side : side;
+                const T = isRNN ? Math.max(1, Math.min(4, seqLen || 1)) : 1;
+                const dimForVector = isCNN ? dim * dim : isRNN ? T * dim : dim;
                 setInputVector((prev) => {
                   const next = Array.from({ length: dimForVector }, (_, i) => prev[i] ?? 0.5);
                   const mean =
@@ -1003,6 +1206,101 @@ export default function App() {
               className="w-16 bg-slate-700 border border-slate-600 rounded px-1 text-sm"
             />
           </div>
+          {architecture === 'rnn' && (
+            <div className="flex items-center gap-2 px-3">
+              <span className="text-xs text-slate-400">Seq Len:</span>
+              <input
+                type="number"
+                value={seqLen}
+                min={1}
+                max={4}
+                onChange={(e) => {
+                  const raw = Number(e.target.value) || 1;
+                  const T = Math.max(1, Math.min(4, raw));
+                  setSeqLen(T);
+
+                  const d = inputDim || 1;
+                  const dimForVector = T * d;
+                  setInputVector((prev) => {
+                    const next = Array.from({ length: dimForVector }, (_, i) => prev[i] ?? 0.5);
+                    const mean =
+                      next.length > 0
+                        ? next.reduce((a, b) => a + b, 0) / next.length
+                        : 0;
+                    setInputValue(mean);
+                    return next;
+                  });
+                }}
+                className="w-16 bg-slate-700 border border-slate-600 rounded px-1 text-sm"
+              />
+            </div>
+          )}
+          {architecture === 'rnn' && (
+            <div className="flex items-center gap-2 px-3">
+              <span className="text-xs text-slate-400">h0:</span>
+              <button
+                type="button"
+                onClick={() => {
+                  const H = Math.max(1, hiddenDim || 1);
+                  const rand = () => Math.random() * 2 - 1;
+                  const vec = Array.from({ length: H }, () => rand());
+                  setRnnH0(vec);
+                  setParamOverrides((prev) => {
+                    const next = { ...prev };
+                    Object.keys(next).forEach((key) => {
+                      if (key.endsWith(':h0')) {
+                        delete next[key];
+                      }
+                    });
+                    return next;
+                  });
+                }}
+                className="bg-slate-700 hover:bg-slate-600 text-white px-2 py-1 rounded-md text-[11px] border border-slate-500"
+              >
+                Randomize all h0 (same)
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const H = Math.max(1, hiddenDim || 1);
+                  const L = Math.max(1, layers || 1);
+                  const rand = () => Math.random() * 2 - 1;
+                  setParamOverrides((prev) => {
+                    const next = { ...prev };
+                    for (let layerIdx = 0; layerIdx < L; layerIdx++) {
+                      const nodeIndex = 1 + layerIdx;
+                      const key = `layer-${nodeIndex}:h0`;
+                      next[key] = Array.from({ length: H }, () => rand());
+                    }
+                    return next;
+                  });
+                }}
+                className="bg-slate-700 hover:bg-slate-600 text-white px-2 py-1 rounded-md text-[11px] border border-slate-500"
+              >
+                Randomize all h0 (different)
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const H = Math.max(1, hiddenDim || 1);
+                  const zeros = Array.from({ length: H }, () => 0);
+                  setRnnH0(zeros);
+                  setParamOverrides((prev) => {
+                    const next = { ...prev };
+                    Object.keys(next).forEach((key) => {
+                      if (key.endsWith(':h0')) {
+                        delete next[key];
+                      }
+                    });
+                    return next;
+                  });
+                }}
+                className="bg-slate-700 hover:bg-slate-600 text-white px-2 py-1 rounded-md text-[11px] border border-slate-500"
+              >
+                Set all h0 = 0
+              </button>
+            </div>
+          )}
           <div className="flex items-center gap-2 px-3">
             <span className="text-xs text-slate-400">Activation:</span>
             <select
@@ -1046,9 +1344,9 @@ export default function App() {
             onClick={() => {
               setInitMode('random');
               setParamOverrides({});
+              setFrozenParams({});
               setEditingParam(null);
               setEditingParamValue(null);
-              runSimulation();
             }}
             className="bg-slate-700 hover:bg-slate-600 text-white px-3 py-1.5 rounded-md text-xs font-medium border border-slate-500"
           >
@@ -1102,7 +1400,6 @@ export default function App() {
               }}
               onMouseLeave={() => {
                 if (pinnedNodeId) {
-                  // Restore pinned node overlay when leaving the param bar.
                   const pinned = nodes.find((n) => n.id === pinnedNodeId);
                   const data = pinned?.data as { label?: string; details?: LayerDetails } | undefined;
 
@@ -1128,7 +1425,6 @@ export default function App() {
                     setActiveNodeParams(null);
                   }
                 } else {
-                  // No pin: clear overlay when leaving param bar.
                   highlightPathTo(null);
                   setActiveParam(null);
                   setActiveNodeParams(null);
@@ -1143,7 +1439,6 @@ export default function App() {
                 }
               }}
               onClick={() => {
-                // Toggle behavior: if this param is already being edited, close the editor
                 if (
                   editingParam &&
                   editingParam.nodeId === p.nodeId &&
@@ -1184,11 +1479,8 @@ export default function App() {
                   const hasSample = info.value_sample && info.value_sample.length;
 
                   if (hasSample && info.value_sample!.length >= total) {
-                    // Use engine-provided samples directly (e.g. real MLP weights)
                     flatVals = info.value_sample!.slice(0, total);
                   } else {
-                    // For conceptual params (CNN/RNN/Transformer) or missing samples,
-                    // seed the grid with random values so entries are visibly colored.
                     const rand = () => Math.random() * 2 - 1; // ~Uniform(-1,1)
                     flatVals = Array.from({ length: total }, () => rand());
                   }
@@ -1438,6 +1730,238 @@ export default function App() {
                     renderVector(overlayActivations.outVec)
                   )}
                 </div>
+
+                {architecture === 'rnn' &&
+                  effectiveLayerLabel &&
+                  effectiveLayerLabel.startsWith('RNN') &&
+                  activeLayerDetails && (
+                    <div className="mt-2 rounded border border-slate-700 bg-slate-900/80 p-2">
+                      <div className="mb-1 flex justify-between items-center">
+                        <span className="text-[9px] text-slate-400 font-mono">RNN timesteps</span>
+                        {(() => {
+                          const shape = activeLayerDetails.in_shape as number[] | string;
+                          let T = 0;
+                          if (Array.isArray(shape) && shape.length >= 2) {
+                            T = typeof shape[0] === 'number' ? shape[0] : 0;
+                          }
+                          if (!T) {
+                            T = Math.max(1, Math.min(4, seqLen || 1));
+                          }
+                          const tActive = ((rnnStep % T) + T) % T;
+                          return (
+                            <span className="text-[9px] text-slate-500 font-mono">
+                              t = {tActive + 1} / {T}
+                            </span>
+                          );
+                        })()}
+                      </div>
+                      {(() => {
+                        const inShape = activeLayerDetails.in_shape as number[] | string;
+                        const outShape = activeLayerDetails.out_shape as number[] | string;
+
+                        let T = 0;
+                        let d = 0;
+                        let H = 0;
+
+                        if (Array.isArray(inShape) && inShape.length >= 2) {
+                          T = typeof inShape[0] === 'number' ? inShape[0] : 0;
+                          d = typeof inShape[1] === 'number' ? inShape[1] : 0;
+                        }
+                        if (Array.isArray(outShape) && outShape.length >= 2) {
+                          if (!T) {
+                            T = typeof outShape[0] === 'number' ? outShape[0] : 0;
+                          }
+                          H = typeof outShape[1] === 'number' ? outShape[1] : 0;
+                        }
+
+                        if (!T) {
+                          T = Math.max(1, Math.min(4, seqLen || 1));
+                        }
+                        if (!d) {
+                          d = Math.max(1, Math.min(16, inputDim || 1));
+                        }
+                        if (!H) {
+                          H = Math.max(1, Math.min(16, hiddenDim || 1));
+                        }
+
+                        const tActive = ((rnnStep % T) + T) % T;
+
+                        const flatIn = (activeLayerDetails.input_sample && activeLayerDetails.input_sample.length
+                          ? activeLayerDetails.input_sample
+                          : activeLayerDetails.output_sample || []) as number[];
+                        const flatOut = (activeLayerDetails.output_sample && activeLayerDetails.output_sample.length
+                          ? activeLayerDetails.output_sample
+                          : activeLayerDetails.input_sample || []) as number[];
+
+                        const getRow = (flat: number[], rowLen: number, t: number): number[] => {
+                          if (rowLen <= 0) return [];
+                          if (!flat.length) {
+                            return Array.from({ length: rowLen }, () => 0);
+                          }
+                          const start = t * rowLen;
+                          const end = start + rowLen;
+                          if (end <= flat.length) {
+                            return flat.slice(start, end);
+                          }
+                          const row: number[] = [];
+                          for (let j = 0; j < rowLen; j++) {
+                            const idx = (start + j) % flat.length;
+                            row.push(flat[idx]);
+                          }
+                          return row;
+                        };
+
+                        const formatVec = (row: number[]): string => {
+                          if (!row.length) return '[ ]';
+                          const maxCols = 6;
+                          const parts = row.slice(0, maxCols).map((v) => v.toFixed(2));
+                          const suffix = row.length > maxCols ? ', …' : '';
+                          return `[ ${parts.join(', ')}${suffix} ]`;
+                        };
+
+                        const rows: JSX.Element[] = [];
+                        rows.push(
+                          <div
+                            key="hdr"
+                            className="grid grid-cols-4 gap-1 text-[9px] text-slate-400 font-mono mb-1"
+                          >
+                            <span className="text-center">t</span>
+                            <span className="text-center">x_t</span>
+                            <span className="text-center">h_t</span>
+                            <span className="text-center">y_t</span>
+                          </div>,
+                        );
+
+                        const computeYRow = (t: number, xRow: number[], hRow: number[]): number[] => {
+                          const params = (activeLayerDetails.params || {}) as Record<string, ParamInfo>;
+                          const Wy = params.W_y;
+                          const Uy = params.U_y;
+                          const By = params.b_y;
+
+                          if (
+                            Wy && Uy && By &&
+                            Array.isArray(Wy.shape) && Wy.shape.length === 2 &&
+                            Array.isArray(Uy.shape) && Uy.shape.length === 2 &&
+                            Array.isArray(By.shape) && By.shape.length === 1 &&
+                            Wy.value_sample.length &&
+                            Uy.value_sample.length &&
+                            By.value_sample.length &&
+                            Wy.shape[0] === H &&
+                            Wy.shape[1] === H &&
+                            Uy.shape[0] === d &&
+                            Uy.shape[1] === H &&
+                            By.shape[0] === H
+                          ) {
+                            const y: number[] = [];
+                            const wyVals = Wy.value_sample;
+                            const uyVals = Uy.value_sample;
+                            const byVals = By.value_sample;
+                            for (let j = 0; j < H; j++) {
+                              let sum = 0;
+                              for (let k = 0; k < H; k++) {
+                                const w = wyVals[k * H + j] ?? 0;
+                                sum += (hRow[k] ?? 0) * w;
+                              }
+                              for (let i = 0; i < d; i++) {
+                                const w = uyVals[i * H + j] ?? 0;
+                                sum += (xRow[i] ?? 0) * w;
+                              }
+                              sum += byVals[j] ?? 0;
+                              y.push(sum);
+                            }
+                            return y;
+                          }
+
+                          // Fallback: simple combination if we can't read real weights
+                          const alpha = 0.7;
+                          const beta = 0.3;
+                          const yFallback: number[] = [];
+                          for (let j = 0; j < H; j++) {
+                            const hVal = hRow[j] ?? 0;
+                            const xVal = d > 0 ? xRow[j % d] ?? 0 : 0;
+                            yFallback.push(alpha * hVal + beta * xVal);
+                          }
+                          return yFallback;
+                        };
+
+                        for (let t = 0; t < T; t++) {
+                          const isActiveRow = t === tActive;
+                          const xRow = getRow(flatIn, d, t);
+                          const hRow = getRow(flatOut, H, t);
+
+                          const yRow = computeYRow(t, xRow, hRow);
+
+                          rows.push(
+                            <div
+                              key={t}
+                              className={`grid grid-cols-4 gap-1 text-[9px] font-mono px-1 py-0.5 rounded ${
+                                isActiveRow
+                                  ? 'bg-amber-500/10 text-amber-100'
+                                  : 'opacity-40 text-slate-400'
+                              }`}
+                            >
+                              <span className="text-center">{t + 1}</span>
+                              {viewMode === 'numbers' ? (
+                                <>
+                                  <span className="text-center">{formatVec(xRow)}</span>
+                                  <span className="text-center">{formatVec(hRow)}</span>
+                                  <span className="text-center">{formatVec(yRow)}</span>
+                                </>
+                              ) : (
+                                <>
+                                  <div className="flex justify-center gap-[1px]">
+                                    {xRow
+                                      .slice(0, Math.min(12, xRow.length || 1))
+                                      .map((v, idx) => (
+                                        <div
+                                          key={idx}
+                                          className="w-3 h-3 rounded-sm"
+                                          style={{ backgroundColor: valueToColor(v) }}
+                                        />
+                                      ))}
+                                    {xRow.length > 12 && (
+                                      <span className="text-[8px] text-slate-500 ml-1">…</span>
+                                    )}
+                                  </div>
+                                  <div className="flex justify-center gap-[1px]">
+                                    {hRow
+                                      .slice(0, Math.min(12, hRow.length || 1))
+                                      .map((v, idx) => (
+                                        <div
+                                          key={idx}
+                                          className="w-3 h-3 rounded-sm"
+                                          style={{ backgroundColor: valueToColor(v) }}
+                                        />
+                                      ))}
+                                    {hRow.length > 12 && (
+                                      <span className="text-[8px] text-slate-500 ml-1">…</span>
+                                    )}
+                                  </div>
+                                  <div className="flex justify-center gap-[1px]">
+                                    {yRow
+                                      .slice(0, Math.min(12, yRow.length || 1))
+                                      .map((v, idx) => (
+                                        <div
+                                          key={idx}
+                                          className="w-3 h-3 rounded-sm"
+                                          style={{ backgroundColor: valueToColor(v) }}
+                                        />
+                                      ))}
+                                    {yRow.length > 12 && (
+                                      <span className="text-[8px] text-slate-500 ml-1">…</span>
+                                    )}
+                                  </div>
+                                </>
+                              )}
+                            </div>,
+                          );
+                        }
+
+                        return <div className="mt-1 space-y-0.5">{rows}</div>;
+                      })()}
+                    </div>
+                  )}
+
                 {effectiveLayerLabel &&
                   (effectiveLayerLabel.startsWith('Input') ||
                     effectiveLayerLabel.startsWith('Input Seq') ||
@@ -1445,11 +1969,19 @@ export default function App() {
                     effectiveLayerLabel.startsWith('Positional')) && (
                   <div className="mt-2 space-y-1">
                     <div className="flex items-center justify-between">
-                      <span className="text-slate-500">Input vector (d = {effectiveInputDim ?? inputDim}):</span>
+                      <span className="text-slate-500">
+                        {architecture === 'rnn'
+                          ? `Input seq (T = ${Math.max(
+                              1,
+                              Math.min(4, seqLen || 1),
+                            )}, d = ${inputDim || effectiveInputDim || 1})`
+                          : `Input vector (d = ${effectiveInputDim ?? inputDim})`}
+                      </span>
                       <span className="text-slate-400 font-mono text-[10px]">
                         mean = {inputValue.toFixed(3)}
                       </span>
                     </div>
+
                     <div className="max-h-32 overflow-y-auto pr-1">
                       {(() => {
                         const dim = effectiveInputDim || inputDim || 1;
@@ -1461,6 +1993,11 @@ export default function App() {
                           const size = Math.max(1, Math.floor(Math.sqrt(total)));
                           rows = size;
                           cols = size;
+                        } else if (architecture === 'rnn') {
+                          const T = Math.max(1, Math.min(4, seqLen || 1));
+                          const d = Math.max(1, Math.min(16, inputDim || 1));
+                          rows = T;
+                          cols = d;
                         }
 
                         const cells: JSX.Element[] = [];
@@ -1470,6 +2007,10 @@ export default function App() {
                             if (i >= total) break;
                             const v = inputVector[i] ?? 0;
                             const isActive = activeInputIndex === i;
+                            const isInactiveRnnRow =
+                              architecture === 'rnn' && rows > 1
+                                ? r !== ((rnnStep % rows) + rows) % rows
+                                : false;
                             cells.push(
                               <button
                                 key={i}
@@ -1477,7 +2018,7 @@ export default function App() {
                                 className={`w-4 h-4 rounded-sm border ${
                                   isActive
                                     ? 'ring-2 ring-blue-400 ring-offset-1 ring-offset-slate-900 border-transparent'
-                                    : 'border-slate-600'
+                                    : `border-slate-600${isInactiveRnnRow ? ' opacity-40' : ''}`
                                 }`}
                                 style={{ backgroundColor: valueToColor(v) }}
                                 onMouseEnter={() => setHoveredInputIndex(i)}
@@ -1504,39 +2045,40 @@ export default function App() {
                     </div>
                     {activeInputIndex !== null &&
                       activeInputIndex < (effectiveInputDim || inputDim) && (
-                      <div className="mt-2 flex items-center gap-2">
-                        <span className="w-10 text-slate-500 font-mono">x{activeInputIndex}</span>
-                        <input
-                          type="range"
-                          min={-1}
-                          max={1}
-                          step={0.01}
-                          value={inputVector[activeInputIndex] ?? 0}
-                          onChange={(e) =>
-                            handleInputEntryChange(activeInputIndex, Number(e.target.value))
-                          }
-                          className="flex-1"
-                        />
-                        <span className="w-14 text-right text-slate-100 font-mono">
-                          {(inputVector[activeInputIndex] ?? 0).toFixed(2)}
-                        </span>
-                      </div>
-                    )}
+                        <div className="mt-2 flex items-center gap-2">
+                          <span className="w-10 text-slate-500 font-mono">x{activeInputIndex}</span>
+                          <input
+                            type="range"
+                            min={-1}
+                            max={1}
+                            step={0.01}
+                            value={inputVector[activeInputIndex] ?? 0}
+                            onChange={(e) =>
+                              handleInputEntryChange(activeInputIndex, Number(e.target.value))
+                            }
+                            className="flex-1"
+                          />
+                          <span className="w-14 text-right text-slate-100 font-mono">
+                            {(inputVector[activeInputIndex] ?? 0).toFixed(2)}
+                          </span>
+                        </div>
+                      )}
                   </div>
                 )}
-              </div>
-            )}
-            {overlayBackSignal && (
-              <div className="mt-2 flex items-center gap-3 justify-start text-slate-100">
-                <span className="uppercase tracking-wider text-slate-400 text-[10px]">
-                  backprop to prev
-                </span>
-                <span className="flex items-center gap-1 font-mono text-sm">
-                  <span className="text-slate-400">←</span>
-                  <span className="text-[13px]">
-                    <Latex>{`$$ ${overlayBackSignal} $$`}</Latex>
-                  </span>
-                </span>
+
+                {overlayBackSignal && (
+                  <div className="mt-2 flex items-center gap-3 justify-start text-slate-100">
+                    <span className="uppercase tracking-wider text-slate-400 text-[10px]">
+                      backprop to prev
+                    </span>
+                    <span className="flex items-center gap-1 font-mono text-sm">
+                      <span className="text-slate-400">←</span>
+                      <span className="text-[13px]">
+                        <Latex>{`$$ ${overlayBackSignal} $$`}</Latex>
+                      </span>
+                    </span>
+                  </div>
+                )}
               </div>
             )}
             {activeChainRules.map(({ chip, latex }) => (
