@@ -1538,7 +1538,7 @@ export default function App() {
             </div>
           )}
           {architecture === 'rnn' && (
-            <div className="flex items-center gap-2 px-3">
+            <div className="flex items-center gap-1 px-2">
               <span className="text-xs text-slate-400">h0:</span>
               <button
                 type="button"
