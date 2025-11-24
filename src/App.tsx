@@ -1557,7 +1557,7 @@ export default function App() {
                     return next;
                   });
                 }}
-                className="bg-slate-700 hover:bg-slate-600 text-white px-2 py-1 rounded-md text-[11px] border border-slate-500"
+                className="bg-slate-700 hover:bg-slate-600 text-white px-2 py-1 rounded-md text-[10px] border border-slate-500"
               >
                 Randomize all h0 (same)
               </button>
@@ -1577,7 +1577,7 @@ export default function App() {
                     return next;
                   });
                 }}
-                className="bg-slate-700 hover:bg-slate-600 text-white px-2 py-1 rounded-md text-[11px] border border-slate-500"
+                className="bg-slate-700 hover:bg-slate-600 text-white px-2 py-1 rounded-md text-[10px] border border-slate-500"
               >
                 Randomize all h0 (different)
               </button>
@@ -1597,7 +1597,7 @@ export default function App() {
                     return next;
                   });
                 }}
-                className="bg-slate-700 hover:bg-slate-600 text-white px-2 py-1 rounded-md text-[11px] border border-slate-500"
+                className="bg-slate-700 hover:bg-slate-600 text-white px-3 py-1 rounded-md text-[10px] border border-slate-500 whitespace-nowrap"
               >
                 Set all h0 = 0
               </button>
